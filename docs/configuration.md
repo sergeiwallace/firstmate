@@ -362,6 +362,20 @@ Like `fm-send.sh`, the command requires `FM_HOME` (or `FM_CONFIG_OVERRIDE`) to b
 The two timeouts govern when a native copy that was accepted for an offline session, or delivered but never claimed by the recipient, releases the Agent Mail fallback; a held native copy stays pending until Claude Code's documented terminal hold outcome and never releases a fallback.
 Nothing in this policy sends a message: the native adapter is owned by the coordinating agent, and `fm-send.sh` keeps its own exit and delivery contract unchanged when the chain reaches it.
 
+### Dispatch-body broker (dispatch-bodies.sqlite3)
+
+The operational text of a dispatch never travels as authority. The owning chief home holds one SQLite database, `dispatch-bodies.sqlite3`, and [`bin/fm-dispatch-body.py`](../bin/fm-dispatch-body.py) (standard-library Python; no `sqlite3` CLI needed) is its only writer.
+`stage` commits one record before any transport is attempted: `schema_version` 1, the dispatch id, target `vp_id`, `owner_machine_key`, `owner_epoch`, `chief_generation`, `staged_by_machine_key`, the exact rendered `body_utf8` with no normalization, RFC 3339 UTC `created_at` and `expires_at` (default 24 h, only ever shortened, never below 60 s), and `message_hash` = lowercase-hex SHA-256 of `firstmate-dispatch-body/v1\0` followed by the RFC 8785 canonical JSON of those fields.
+Staging the same id with the same hash again is idempotent; the same id with a different body, target, epoch or timestamp is a terminal conflict (exit 3) and nothing is sent.
+Every write runs under `BEGIN IMMEDIATE` with `synchronous=FULL` and `secure_delete=ON`, followed by a directory fsync; the database is created 0600 and the broker refuses (exit 2) a database or home that another OS identity owns or could read or replace.
+
+[`bin/fm-receive.sh`](../bin/fm-receive.sh) is the recipient's claim gate. Whichever transport arrives first calls it with the dispatch id, the addressed `vp_id` and its route (`native`, `agent-mail`, `fm-send`), plus `--expected-hash` when the envelope carried one. One transaction moves `staged` to `claimed`, records the winning route and an unguessable claim token, and returns `body_utf8` to that caller alone (exit 0), also writing the `$FM_HOME/state/dispatch-inbox/<id>.json` receipt projection with `O_CREAT|O_EXCL`. Every other caller gets the stored receipt and never the body (exit 4): a loser route, a late doorbell after a fallback won, an expired or unknown id. The wrong target VP is refused (exit 2) and a mismatched envelope hash conflicts (exit 3), both leaving the object staged.
+`resume` re-reads a claimed body only with its own claim token; `inject` and `terminal` finish the claim and set the body to NULL in the same transaction; `reconcile-required` records a claimed row whose token or enqueue outcome cannot be proven, NULLs the body, and is never reset to staged; `expire-due` expires unclaimed rows past their deadline; `cleanup --journal <dispatch.jsonl>` removes finished receipts older than seven days only when the append-only journal already holds the same id, hash and terminal state.
+
+[`bin/fm-forward-receive.sh`](../bin/fm-forward-receive.sh) is what the owning chief runs from a forwarded, non-operational doorbell: it checks the forwarded owner epoch (a mismatch is `stale-owner`, exit 3, naming the current epoch) and hash, and returns metadata only so local transport selection can start. It never claims and never prints the body; only the target VP's own `fm-receive` claim can.
+The database path is named, never guessed: `--db`, then `FM_DISPATCH_BODY_DB`, then `$FM_HOME/dispatch-bodies.sqlite3`.
+Not yet enforced by these tools: the peer-credential Unix socket and the per-VP process check (they need the machine registry), the machine singleton lock, and the signed VP-owner record; until those land, naming the target `vp_id` is the gate's authentication in addition to OS file ownership.
+
 ## Backlog backend (.tasks.toml / config/backlog-backend)
 
 The tracked `.tasks.toml` pins the default `tasks-axi` markdown backend to `data/backlog.md`, with `done_keep = 10` and an archive at `data/done-archive.md`.

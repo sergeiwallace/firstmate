@@ -26,6 +26,9 @@ The shared no-mistakes gate lifecycle boundary is summarized in [architecture.md
 | `fm-secondmate-restart-lib.sh` | Shared second-mate restart capability and persistence-request contract |
 | `fm-message-transport.sh` | Validate the ordered chief-of-staff transport policy (`native -> agent-mail -> fm-send`), answer the next allowed step after one attempt, compute durable deadlines, and refuse a dispatch that breaks the phrasing discipline |
 | `fm-message-transport-lib.sh` | Single owner of the transport-policy loader, next-step table, and dispatch phrasing gate |
+| `fm-dispatch-body.py`    | Durable dispatch-body broker: the owning chief's `dispatch-bodies.sqlite3` is the sole authority for a dispatch's operational text; stages one RFC 8785-hashed body before any transport, claims it atomically for exactly one receiver, and NULLs it on injection, terminal outcome or expiry |
+| `fm-receive.sh`          | Recipient claim gate every transport ends in: the first claim for a staged dispatch id receives the body once; every later route, late doorbell, expired or unknown id receives only the stored receipt |
+| `fm-forward-receive.sh`  | Owning chief's entry point for a forwarded dispatch: revalidates the owner epoch and envelope hash and returns metadata only, never the body, so local transport selection can begin |
 | `fm-on.sh`               | Execute one tracked Firstmate command in a configured remote secondmate home, using its job worker except for the doctor bootstrap |
 | `fm-remote-job-lib.sh`   | Shared bounded remote job queue, worker readiness, LaunchAgent contract, and filesystem-composed PATH |
 | `fm-remote-job-worker.sh` | Long-lived remote queue worker for tracked `fm-*.sh` commands in the account runtime |
