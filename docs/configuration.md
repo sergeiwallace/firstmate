@@ -13,6 +13,7 @@ Start with the directory layout, then use the setting reference for the behavior
 | Backlog, preferences, and memory | [Backlog backend](#backlog-backend-taskstoml--configbacklog-backend), [captain preferences](#captain-preferences-datacaptainmd--datacaptain-sharedmd), and [startup memory budget](#startup-memory-budget-configstartup-memory-budget) |
 | Supervision and presentation | [Pi supervision branch](#pi-supervision-branch), [supervision host](#supervision-host-configsupervision-host), and [Calm preference](#calm-preference-configcalm) |
 | Persistent secondmates | [Secondmate routes](#secondmate-routes-datasecondmatesmd) |
+| Chief-of-staff dispatch transports and a required task adapter | [Message transports](#message-transports-configmessage-transportsjson) and [required backend](#required-backend-configbacklog-backend-required) |
 | Per-run overrides and tuning | [Environment variables](#environment-variables) |
 
 ## FM_HOME
@@ -331,10 +332,48 @@ The file is read at every wake, so a change applies at the next one without a re
 It is local to each home and not part of secondmate inherited configuration.
 While the file exists, main's lease-checked commands also take the per-task lease lock, so a claim by the host's engine cannot race a mutation main already started (`bin/fm-lease-lib.sh`).
 
+## Message transports (config/message-transports.json)
+
+A chief-of-staff home reaches the sessions it coordinates through an ordered chain of transports: native `ListAgents`/`SendMessage` first, Agent Mail second, and this repo's existing `fm-send.sh` route last.
+`config/message-transports.json` expresses that policy and nothing else; the order is fixed, so the loader accepts exactly one shape and fails closed, naming the field, on any other.
+[`docs/examples/message-transports.json`](examples/message-transports.json) is the approved default:
+
+```json
+{
+  "schema_version": 1,
+  "primary": "native",
+  "fallbacks": ["agent-mail", "fm-send"],
+  "offline_pending_timeout_seconds": 600,
+  "native_activation_timeout_seconds": 600
+}
+```
+
+| Field | Accepted value |
+| --- | --- |
+| `schema_version` | `1` |
+| `primary` | `"native"` |
+| `fallbacks` | `["agent-mail", "fm-send"]`, in that order |
+| `offline_pending_timeout_seconds` | whole seconds, 60-3600; default 600 when omitted |
+| `native_activation_timeout_seconds` | whole seconds, 60-3600; default 600 when omitted |
+
+Any unknown key, a missing or reordered adapter, or a timeout that is zero, negative, fractional, or outside the range is refused before dispatch rather than clamped.
+[`bin/fm-message-transport.sh`](../bin/fm-message-transport.sh) is the command-line face of the policy ([`bin/fm-message-transport-lib.sh`](../bin/fm-message-transport-lib.sh) owns it): `--dry-run` validates and prints `native -> agent-mail -> fm-send`; `next <transport> <outcome>` answers what the policy allows after one attempt; `deadline` computes the durable accepted-offline or activation deadline once from the acceptance time; `check-dispatch` refuses a bare slash command, an unnamed skill, or a missing acknowledgement line before anything is sent.
+Like `fm-send.sh`, the command requires `FM_HOME` (or `FM_CONFIG_OVERRIDE`) to be named rather than guessing a home.
+The two timeouts govern when a native copy that was accepted for an offline session, or delivered but never claimed by the recipient, releases the Agent Mail fallback; a held native copy stays pending until Claude Code's documented terminal hold outcome and never releases a fallback.
+Nothing in this policy sends a message: the native adapter is owned by the coordinating agent, and `fm-send.sh` keeps its own exit and delivery contract unchanged when the chain reaches it.
+
 ## Backlog backend (.tasks.toml / config/backlog-backend)
 
 The tracked `.tasks.toml` pins the default `tasks-axi` markdown backend to `data/backlog.md`, with `done_keep = 10` and an archive at `data/done-archive.md`.
 A home may instead select another tasks-axi adapter such as Beads through its own `.tasks.toml` or `TASKS_AXI_BACKEND`; firstmate still uses only tasks-axi verbs for routine backlog reads and mutations, and the adapter maps `start` and evidence-bearing `done` transitions to its native statuses and evidence fields.
+
+### Required backend (config/backlog-backend-required)
+
+A home that must never fall back to a markdown backlog names its adapter in `config/backlog-backend-required` (for a chief-of-staff home, `beads`).
+When that file is present and non-empty, [`bin/fm-tasks-axi.sh`](../bin/fm-tasks-axi.sh) exits 2 before running tasks-axi, and the automatic dispatch and completion transitions report an error instead of skipping, whenever the resolved adapter differs from the required one, `config/backlog-backend=manual` is also selected, or tasks-axi is missing or below the supported minimum.
+The refusal names both the required and the resolved adapter.
+Without the file every default above is unchanged, including the markdown and manual fallbacks.
+The home's own `.tasks.toml` still selects the adapter; the requirement only refuses to proceed when that selection is not in effect.
 
 ### Captain holds on Beads
 

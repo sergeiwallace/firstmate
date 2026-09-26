@@ -285,6 +285,14 @@ fm_backlog_transition_applies() {  # <config-dir> <data-dir> <kind>
     return 1
   fi
   if fm_backlog_backend_manual "$config"; then
+    # A home that REQUIRES an adapter may not opt into manual editing: that is an
+    # error to surface, not a transition to skip (bin/fm-tasks-axi-lib.sh).
+    if [ -n "$(fm_tasks_axi_required_backend "$config")" ]; then
+      fm_tasks_axi_required_backend_check "$config" "$config" || {
+        FM_BACKLOG_TRANSITION_ERROR=$FM_TASKS_AXI_REQUIRED_ERROR
+        return 2
+      }
+    fi
     FM_BACKLOG_TRANSITION_SKIP="config/backlog-backend selects manual editing"
     return 1
   fi
@@ -299,6 +307,12 @@ fm_backlog_transition_applies() {  # <config-dir> <data-dir> <kind>
     FM_BACKLOG_TRANSITION_ERROR=$backend
     return 2
   }
+  # Fail closed before the markdown arm: a required adapter never degrades to the
+  # markdown backlog or to a manual edit (bin/fm-tasks-axi-lib.sh owns the rule).
+  if ! fm_tasks_axi_required_backend_check "$config" "$root"; then
+    FM_BACKLOG_TRANSITION_ERROR=$FM_TASKS_AXI_REQUIRED_ERROR
+    return 2
+  fi
   if [ "$backend" = markdown ]; then
     file=$(fm_backlog_file "$data") || return 2
     if [ ! -e "$file" ] && [ ! -L "$file" ]; then
