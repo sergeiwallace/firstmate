@@ -24,6 +24,8 @@ The shared no-mistakes gate lifecycle boundary is summarized in [architecture.md
 | `fm-update.sh`           | Guarded self-update of firstmate and local or remote secondmate homes, reconciling redundant divergence and classifying every live mate left on the target commit for restart or fallback nudge |
 | `fm-secondmate-restart.sh` | Persist open conversational work, then restart eligible second mates or report the fallback outcome |
 | `fm-secondmate-restart-lib.sh` | Shared second-mate restart capability and persistence-request contract |
+| `fm-message-transport.sh` | Validate the ordered chief-of-staff transport policy (`native -> agent-mail -> fm-send`), answer the next allowed step after one attempt, compute durable deadlines, and refuse a dispatch that breaks the phrasing discipline |
+| `fm-message-transport-lib.sh` | Single owner of the transport-policy loader, next-step table, and dispatch phrasing gate |
 | `fm-on.sh`               | Execute one tracked Firstmate command in a configured remote secondmate home, using its job worker except for the doctor bootstrap |
 | `fm-remote-job-lib.sh`   | Shared bounded remote job queue, worker readiness, LaunchAgent contract, and filesystem-composed PATH |
 | `fm-remote-job-worker.sh` | Long-lived remote queue worker for tracked `fm-*.sh` commands in the account runtime |
