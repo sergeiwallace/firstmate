@@ -337,6 +337,10 @@
       "audience": "maintainer-architecture"
     },
     {
+      "path": "docs/examples/chief-routes.json",
+      "audience": "operator-example"
+    },
+    {
       "path": "docs/examples/crew-dispatch.json",
       "audience": "operator-example"
     },
@@ -350,6 +354,10 @@
     },
     {
       "path": "docs/examples/process-event-extension/firstmate-extension.json",
+      "audience": "operator-example"
+    },
+    {
+      "path": "docs/examples/vp-owner-trust.json",
       "audience": "operator-example"
     },
     {

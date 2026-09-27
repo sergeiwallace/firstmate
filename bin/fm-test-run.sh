@@ -411,7 +411,7 @@ family_for_basename() {
     fm-branch-supervision.test.sh|fm-busy-adapter-wiring.test.sh|\
     fm-busy-state.test.sh|fm-classify-corr-token.test.sh|\
     fm-claude-stop-autoarm.test.sh|fm-cursor-harness.test.sh|\
-    fm-dispatch-body.test.sh|fm-dispatch-resolve.test.sh|\
+    fm-dispatch-body.test.sh|fm-dispatch-resolve.test.sh|fm-vp-owner.test.sh|\
     fm-extension-binding.test.sh|fm-gitignore-config.test.sh|\
     fm-message-transport.test.sh|\
     fm-no-mistakes-required.test.sh|fm-peek-remote.test.sh|\
@@ -849,6 +849,7 @@ tests/fm-turnend-guard.test.sh 33450
 tests/fm-update.test.sh 11572
 tests/fm-vendor-auth-probe.test.sh 45255
 tests/fm-voice-relay.test.sh 32486
+tests/fm-vp-owner.test.sh 17714
 tests/fm-wake-daemon-lifecycle-e2e.test.sh 7477
 tests/fm-wake-drain-open-decisions-cursor.test.sh 38506
 tests/fm-wake-drain-open-decisions.test.sh 6890
@@ -1481,6 +1482,11 @@ families_for_changed_path() {
     bin/fm-dispatch-body.py|bin/fm-receive.sh|bin/fm-forward-receive.sh)
       # The dispatch-body broker and its two faces are proven by one suite.
       printf '%s\n' "__script__:fm-dispatch-body.test.sh"
+      ;;
+    bin/fm-vp-owner.py)
+      # The VP-owner authority layer (signer identity, trust registry, owner
+      # records, owner-route resolution) is proven by one suite.
+      printf '%s\n' "__script__:fm-vp-owner.test.sh"
       ;;
     bin/fm-env-lib.sh)
       # The one .env accessor, sourced by bin/fm-x-lib.sh (Relay token) and
