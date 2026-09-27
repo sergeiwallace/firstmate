@@ -1,28 +1,40 @@
 # shellcheck shell=bash
-# fm-message-transport-lib.sh - the ordered messaging-transport policy behind the
+# fm-message-transport-lib.sh - the declared messaging-transport chain behind the
 # chief-of-staff dispatch path.
 # Usage: . bin/fm-message-transport-lib.sh
 #
 # This file is the single owner of three things the chief-of-staff session and
 # its tests need to agree on:
 #   1. Loading and validating config/message-transports.json (schema 1). The
-#      approved order is fixed - native ListAgents/SendMessage first, Agent
-#      Mail second, the existing fm-send.sh route last - so the loader accepts
-#      exactly that shape and FAILS CLOSED, naming the invalid field, on any
-#      other: a missing file, malformed JSON, an unknown adapter, a reordered
-#      chain, an unknown key, or a timeout outside 60-3600 seconds. A missing
-#      timeout defaults to 600; zero, negative, fractional, or out-of-range
-#      values are refused, never clamped.
-#   2. The next-step decision table for one dispatch attempt (fm_mt_next). It
-#      is deterministic and total over the known outcomes so that the same
-#      observation always yields the same transition, whichever path observed
-#      it. `held` stays pending until its documented terminal outcome and never
-#      releases a fallback; accepted-offline and a delivered-but-unclaimed
-#      native doorbell release Agent Mail only through their persisted
-#      deadlines; every other ambiguity stops for reconciliation rather than
-#      resending. Agent Mail that is unconfigured, cancelled, or expired
-#      releases exactly one fm-send attempt, whose own exit contract is
-#      preserved unchanged.
+#      chain is DECLARED by the config, not fixed here: native
+#      ListAgents/SendMessage is always the primary (its outcomes - held,
+#      accepted-offline, activation - are native-specific, so the native-first
+#      principle is not configurable), and `fallbacks` is any subset of the
+#      known fallback adapters - Agent Mail and the existing fm-send.sh route -
+#      in any order, INCLUDING NONE. No fallback adapter is mandatory, so a home
+#      with no Agent Mail configured declares a valid chain by leaving it out.
+#      The loader still FAILS CLOSED, naming the invalid field, on anything
+#      else: a missing file, malformed JSON, a missing `fallbacks` key, an
+#      unknown adapter, `native` repeated as a fallback, a repeated adapter, an
+#      unknown key, or a timeout outside 60-3600 seconds. A missing timeout
+#      defaults to 600; zero, negative, fractional, or out-of-range values are
+#      refused, never clamped.
+#   2. The next-step decision table for one dispatch attempt (fm_mt_next),
+#      resolved against that declared chain. It is in two pure parts: each
+#      (adapter, outcome) pair maps to exactly one OUTCOME CLASS - pending,
+#      advance, done or stop, with an optional record - and the class then maps
+#      to a token against the declared chain, so the table is adapter-agnostic
+#      and stays total and deterministic: the same observation always yields the
+#      same transition, whichever path observed it. `held` stays pending until
+#      its documented terminal outcome and never releases a fallback;
+#      accepted-offline and a delivered-but-unclaimed native doorbell release
+#      the next declared adapter only through their persisted deadlines; every
+#      other ambiguity stops for reconciliation rather than resending. An
+#      `advance` from the LAST adapter in the declared chain is `stop:exhausted`
+#      rather than an invented successor, so a chain of any length - native
+#      alone included - terminates. Because "next" is a property of the declared
+#      chain, fm_mt_next requires a loaded config and refuses an adapter the
+#      chain does not declare. The fm-send exit contract is unchanged.
 #   3. The dispatch-phrasing gate (fm_mt_check_dispatch). A bare slash command
 #      is refused before any send: in the 2026-09-16 live test the bare form did
 #      not fire the recipient's skill, and Claude Code documents that a command
@@ -40,7 +52,9 @@
 
 FM_MT_SCHEMA_VERSION=1
 FM_MT_APPROVED_PRIMARY=native
-FM_MT_APPROVED_FALLBACKS="agent-mail fm-send"
+# The known fallback adapters. Membership is a vocabulary check, not an order:
+# a config may declare any subset of these, in any order, or none at all.
+FM_MT_KNOWN_FALLBACKS="agent-mail fm-send"
 FM_MT_TIMEOUT_MIN=60
 FM_MT_TIMEOUT_MAX=3600
 FM_MT_TIMEOUT_DEFAULT=600
@@ -77,9 +91,10 @@ fm_mt_config_path() {
 
 # fm_mt_load <path>
 # Validate the transport config and export the resolved policy into
-# FM_MT_PRIMARY, FM_MT_FALLBACKS (space-separated), FM_MT_OFFLINE_TIMEOUT and
+# FM_MT_PRIMARY, FM_MT_FALLBACKS (space-separated, in the order declared, empty
+# when the config declares no fallback), FM_MT_OFFLINE_TIMEOUT and
 # FM_MT_ACTIVATION_TIMEOUT. Returns 2 with FM_MT_ERROR="<field>: <reason>" on any
-# deviation from the approved shape.
+# deviation from the accepted shape.
 fm_mt_load() {
   local path=$1 verdict field reason
   FM_MT_ERROR=
@@ -101,7 +116,7 @@ fm_mt_load() {
   verdict=$(jq -r \
     --argjson want_schema "$FM_MT_SCHEMA_VERSION" \
     --arg want_primary "$FM_MT_APPROVED_PRIMARY" \
-    --arg want_fallbacks "$FM_MT_APPROVED_FALLBACKS" \
+    --arg known_fallbacks "$FM_MT_KNOWN_FALLBACKS" \
     --argjson tmin "$FM_MT_TIMEOUT_MIN" \
     --argjson tmax "$FM_MT_TIMEOUT_MAX" \
     --argjson tdefault "$FM_MT_TIMEOUT_DEFAULT" '
@@ -121,17 +136,21 @@ fm_mt_load() {
         elif (has("schema_version")|not) then err("schema_version"; "required")
         elif .schema_version != $want_schema then err("schema_version"; "must be \($want_schema)")
         elif (has("primary")|not) then err("primary"; "required")
-        elif .primary != $want_primary then err("primary"; "must be \"\($want_primary)\" (approved order is fixed)")
-        elif (has("fallbacks")|not) then err("fallbacks"; "required")
+        elif .primary != $want_primary then err("primary"; "must be \"\($want_primary)\" (native is always the primary)")
+        elif (has("fallbacks")|not) then err("fallbacks"; "required (declare the chain explicitly, even as an empty list)")
         elif (.fallbacks|type) != "array" then err("fallbacks"; "must be an array")
-        elif ((.fallbacks|map(type)|unique) != ["string"] and (.fallbacks|length) > 0) then err("fallbacks"; "must contain adapter names")
-        elif (.fallbacks|join(" ")) != $want_fallbacks then err("fallbacks"; "must be [\($want_fallbacks|split(" ")|map("\"\(.)\"")|join(", "))] in that order")
+        elif ((.fallbacks|length) > 0 and (.fallbacks|map(type)|unique) != ["string"]) then err("fallbacks"; "must contain adapter names")
+        elif ((.fallbacks|index($want_primary)) != null) then err("fallbacks"; "must not name \"\($want_primary)\": it is always the primary")
+        elif ((.fallbacks|unique|length) != (.fallbacks|length)) then err("fallbacks"; "must not name an adapter twice")
+        elif ((.fallbacks - ($known_fallbacks|split(" ")))|length) > 0 then err("fallbacks"; "must name only known adapters (\($known_fallbacks|split(" ")|map("\"\(.)\"")|join(", "))); got \"\((.fallbacks - ($known_fallbacks|split(" ")))[0])\"")
         else
           (timeout("offline_pending_timeout_seconds")) as $off
           | if ($off|startswith("error ")) then $off
             else (timeout("native_activation_timeout_seconds")) as $act
             | if ($act|startswith("error ")) then $act
-              else "ok \(.primary) \(.fallbacks|join(",")) \($off) \($act)" end
+              # "-" stands for an empty chain: the verdict is read as whitespace-
+              # separated fields, where an empty one would shift the timeouts.
+              else "ok \(.primary) \(if (.fallbacks|length) == 0 then "-" else (.fallbacks|join(",")) end) \($off) \($act)" end
             end
         end
     end' "$path" 2>/dev/null) || {
@@ -143,7 +162,11 @@ fm_mt_load() {
       # shellcheck disable=SC2086
       set -- $verdict
       FM_MT_PRIMARY=$2
-      FM_MT_FALLBACKS=${3//,/ }
+      if [ "$3" = - ]; then
+        FM_MT_FALLBACKS=
+      else
+        FM_MT_FALLBACKS=${3//,/ }
+      fi
       FM_MT_OFFLINE_TIMEOUT=$4
       FM_MT_ACTIVATION_TIMEOUT=$5
       return 0
@@ -163,7 +186,8 @@ fm_mt_load() {
 }
 
 # fm_mt_order
-# Print the approved chain in display form. Requires a successful fm_mt_load.
+# Print the declared chain in display form, in declared order (just the primary
+# when no fallback is declared). Requires a successful fm_mt_load.
 fm_mt_order() {
   if [ -z "$FM_MT_PRIMARY" ]; then
     FM_MT_ERROR="policy: load the transport config before printing the order"
@@ -177,45 +201,106 @@ fm_mt_order() {
   printf '\n'
 }
 
-# fm_mt_next <transport> <outcome>
-# Print the next action for one dispatch given the outcome the named transport
-# just reported. Tokens:
-#   pending:<what>            keep waiting; no fallback (held, native-offline,
-#                             native-activation, agent-mail)
-#   fallback:<next>[:<record>] attempt <next> with the SAME dispatch id, after
-#                             recording <record> when present
-#   done:<transport>          the dispatch reached its recipient's gate
-#   stop:<why>                do not try a later transport or resend blindly;
-#                             surface the dispatch id (reconcile, verify-pane,
-#                             exhausted)
-# Unknown transport or outcome: status 2 with FM_MT_ERROR.
-fm_mt_next() {
+# fm_mt_classify <transport> <outcome>
+# Step one of the decision table: map one (adapter, outcome) pair to its outcome
+# CLASS in FM_MT_CLASS and, where the class carries one, a detail in
+# FM_MT_DETAIL - the pending reason, the record to persist before advancing, or
+# the reason to stop. Adapter-agnostic by construction: nothing here knows which
+# adapter comes next, or whether one exists. Returns 2 with FM_MT_ERROR on an
+# outcome the named adapter does not report.
+FM_MT_CLASS=
+FM_MT_DETAIL=
+fm_mt_classify() {
   local transport=$1 outcome=$2
   FM_MT_ERROR=
+  FM_MT_CLASS=
+  FM_MT_DETAIL=
   case "$transport/$outcome" in
-    native/delivered) printf '%s\n' pending:native-activation ;;
-    native/held) printf '%s\n' pending:held ;;
-    native/offline) printf '%s\n' pending:native-offline ;;
-    native/offline-timeout) printf '%s\n' fallback:agent-mail:native-timeout ;;
-    native/activation-timeout) printf '%s\n' fallback:agent-mail:native-activation-timeout ;;
-    native/unresolved|native/refused|native/denied|native/expired) printf '%s\n' fallback:agent-mail ;;
-    native/claimed) printf '%s\n' done:native ;;
-    native/ambiguous) printf '%s\n' stop:reconcile ;;
-    agent-mail/unconfigured|agent-mail/cancelled|agent-mail/expired) printf '%s\n' fallback:fm-send ;;
-    agent-mail/pending) printf '%s\n' pending:agent-mail ;;
-    agent-mail/receipt|agent-mail/claimed) printf '%s\n' done:agent-mail ;;
-    agent-mail/ambiguous) printf '%s\n' stop:reconcile ;;
-    fm-send/sent|fm-send/claimed) printf '%s\n' done:fm-send ;;
-    fm-send/inconclusive) printf '%s\n' stop:verify-pane ;;
-    fm-send/failed) printf '%s\n' stop:exhausted ;;
-    fm-send/ambiguous) printf '%s\n' stop:reconcile ;;
-    native/*|agent-mail/*|fm-send/*)
+    native/delivered) FM_MT_CLASS=pending; FM_MT_DETAIL=native-activation ;;
+    native/held) FM_MT_CLASS=pending; FM_MT_DETAIL=held ;;
+    native/offline) FM_MT_CLASS=pending; FM_MT_DETAIL=native-offline ;;
+    native/offline-timeout) FM_MT_CLASS=advance; FM_MT_DETAIL=native-timeout ;;
+    native/activation-timeout) FM_MT_CLASS=advance; FM_MT_DETAIL=native-activation-timeout ;;
+    native/unresolved|native/refused|native/denied|native/expired) FM_MT_CLASS=advance ;;
+    native/claimed) FM_MT_CLASS=done ;;
+    native/ambiguous) FM_MT_CLASS=stop; FM_MT_DETAIL=reconcile ;;
+    agent-mail/unconfigured|agent-mail/cancelled|agent-mail/expired) FM_MT_CLASS=advance ;;
+    agent-mail/pending) FM_MT_CLASS=pending; FM_MT_DETAIL=agent-mail ;;
+    agent-mail/receipt|agent-mail/claimed) FM_MT_CLASS=done ;;
+    agent-mail/ambiguous) FM_MT_CLASS=stop; FM_MT_DETAIL=reconcile ;;
+    fm-send/sent|fm-send/claimed) FM_MT_CLASS=done ;;
+    # Possibly delivered: stop and read the pane rather than resend.
+    fm-send/inconclusive) FM_MT_CLASS=stop; FM_MT_DETAIL=verify-pane ;;
+    fm-send/failed) FM_MT_CLASS=advance ;;
+    fm-send/ambiguous) FM_MT_CLASS=stop; FM_MT_DETAIL=reconcile ;;
+    *)
       FM_MT_ERROR="outcome: '$outcome' is not a known $transport outcome"
       return 2
       ;;
+  esac
+}
+
+# fm_mt_next <transport> <outcome>
+# Print the next action for one dispatch given the outcome the named transport
+# just reported, resolving the outcome's class against the DECLARED chain
+# (primary first, then the fallbacks in declared order). Requires a successful
+# fm_mt_load, because a successor is a property of that chain. Tokens:
+#   pending:<what>            keep waiting; no fallback (held, native-offline,
+#                             native-activation, agent-mail)
+#   fallback:<next>[:<record>] attempt <next>, the adapter declared after this
+#                             one, with the SAME dispatch id, after recording
+#                             <record> when present
+#   done:<transport>          the dispatch reached its recipient's gate
+#   stop:<why>                do not try a later transport or resend blindly;
+#                             surface the dispatch id (reconcile, verify-pane,
+#                             exhausted - the last declared adapter has no
+#                             successor)
+# No loaded policy, an adapter the chain does not declare, an unknown adapter,
+# or an unknown outcome: status 2 with FM_MT_ERROR.
+fm_mt_next() {
+  local transport=$1 outcome=$2 chain successor= seen=0 t
+  FM_MT_ERROR=
+  if [ -z "$FM_MT_PRIMARY" ]; then
+    FM_MT_ERROR="policy: load the transport config before asking for the next step"
+    return 2
+  fi
+  case " $FM_MT_APPROVED_PRIMARY $FM_MT_KNOWN_FALLBACKS " in
+    *" $transport "*) ;;
     *)
-      FM_MT_ERROR="transport: '$transport' is not one of native, agent-mail, fm-send"
+      FM_MT_ERROR="transport: '$transport' is not one of ${FM_MT_APPROVED_PRIMARY}, ${FM_MT_KNOWN_FALLBACKS// /, }"
       return 2
+      ;;
+  esac
+  chain="$FM_MT_PRIMARY${FM_MT_FALLBACKS:+ $FM_MT_FALLBACKS}"
+  case " $chain " in
+    *" $transport "*) ;;
+    *)
+      FM_MT_ERROR="transport: '$transport' is not in the declared chain ($(fm_mt_order))"
+      return 2
+      ;;
+  esac
+  fm_mt_classify "$transport" "$outcome" || return 2
+  for t in $chain; do
+    if [ "$seen" = 1 ]; then
+      successor=$t
+      break
+    fi
+    if [ "$t" = "$transport" ]; then
+      seen=1
+    fi
+  done
+  case "$FM_MT_CLASS" in
+    pending) printf 'pending:%s\n' "$FM_MT_DETAIL" ;;
+    done) printf 'done:%s\n' "$transport" ;;
+    stop) printf 'stop:%s\n' "$FM_MT_DETAIL" ;;
+    advance)
+      if [ -z "$successor" ]; then
+        printf 'stop:exhausted\n'
+      elif [ -n "$FM_MT_DETAIL" ]; then
+        printf 'fallback:%s:%s\n' "$successor" "$FM_MT_DETAIL"
+      else
+        printf 'fallback:%s\n' "$successor"
+      fi
       ;;
   esac
 }
