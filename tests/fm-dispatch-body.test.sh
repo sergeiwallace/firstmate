@@ -450,6 +450,25 @@ test_receive_wrapper_refuses_without_a_named_database_or_required_fields() {
   pass "the shell faces refuse a missing database, target, or route instead of guessing"
 }
 
+# A claim token is only useful if its winner can pass it back on a command line.
+# A token that begins with "-" is read as an option, so resume, inject and
+# terminal all fail with a usage error and the dispatch can never be finished.
+# One claim would only sample the generator, so this exercises it many times.
+test_no_minted_claim_token_can_be_read_as_an_option() {
+  run 0 "mint many claim tokens" python3 - "$BROKER" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("broker", sys.argv[1])
+broker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(broker)
+tokens = [broker.mint_claim_token() for _ in range(2000)]
+bad = [t for t in tokens if t.startswith("-")]
+assert not bad, f"{len(bad)} minted tokens begin with a dash, e.g. {bad[0]}"
+assert len(set(tokens)) == len(tokens), "minted tokens repeated"
+assert all(len(t) >= 43 for t in tokens), "minted tokens are too short to be unguessable"
+PY
+  pass "a minted claim token can never be read as a command-line option"
+}
+
 test_stage_commits_a_private_database_and_a_verifiable_hash
 test_stage_is_idempotent_for_same_content_and_a_conflict_otherwise
 test_stage_refuses_invalid_input_before_any_change
@@ -465,3 +484,4 @@ test_reconcile_required_is_surfaced_and_never_restaged
 test_forward_receive_returns_metadata_only_and_refuses_a_stale_epoch
 test_cleanup_removes_only_journaled_old_receipts
 test_receive_wrapper_refuses_without_a_named_database_or_required_fields
+test_no_minted_claim_token_can_be_read_as_an_option
