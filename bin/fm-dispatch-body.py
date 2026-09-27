@@ -57,6 +57,9 @@ DEFAULT_TTL_SECONDS = 24 * 3600
 TTL_MIN_SECONDS = 60
 RETENTION_DAYS = 7
 BUSY_TIMEOUT_MS = 5000
+# The known-route vocabulary a winner_route may name, not a dispatch chain: which
+# of these a chief actually attempts, and in what order, is declared per home in
+# config/message-transports.json, so the broker accepts any known route.
 ROUTES = ("native", "agent-mail", "fm-send")
 STATES = ("staged", "claimed", "reconcile-required", "injected", "terminal", "expired")
 RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
@@ -226,6 +229,17 @@ def receipt_of(row):
     return {k: row[k] for k in RECEIPT_COLUMNS}
 
 
+def mint_claim_token():
+    """An unguessable claim token the winner can always pass on a command line.
+
+    Hex, not urlsafe base64: token_urlsafe can begin with "-", and the winner's
+    own `--claim-token <token>` is then parsed as an option rather than a value,
+    so resume, inject and terminal all fail with a usage error instead of
+    finishing the dispatch. That is a 1-in-64 dispatch, which reads as a flake.
+    """
+    return secrets.token_hex(32)
+
+
 def fetch(conn, dispatch_id):
     return conn.execute("SELECT * FROM dispatch_bodies WHERE dispatch_id=?", (dispatch_id,)).fetchone()
 
@@ -366,7 +380,7 @@ def cmd_claim(args):
             raise Refusal(EXIT_RECEIPT, f"receipt-only: dispatch {dispatch_id} is {row['state']}"
                           + (f" (winner {row['winner_route']})" if row["winner_route"] else ""),
                           receipt=receipt_of(row))
-        token = secrets.token_urlsafe(32)
+        token = mint_claim_token()
         cur = conn.execute(
             "UPDATE dispatch_bodies SET state='claimed', winner_route=?, claim_token=?, claimed_at=?"
             " WHERE dispatch_id=? AND state='staged'", (route, token, now, dispatch_id))

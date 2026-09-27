@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# fm-message-transport.sh - command-line face of the ordered messaging-transport
+# fm-message-transport.sh - command-line face of the declared messaging-transport
 # policy (bin/fm-message-transport-lib.sh) used by the chief-of-staff dispatch path.
 #
 # Usage: fm-message-transport.sh [--config <path>] <command> [args...]
 #   validate                     load the policy; print the resolved fields, or the
 #                                invalid field and exit 2 (fail closed before dispatch)
-#   --dry-run | order            validate, then print the chain: native -> agent-mail -> fm-send
-#   next <transport> <outcome>   print the next action token for one dispatch attempt
-#                                (see the library header for the token grammar)
+#   --dry-run | order            validate, then print the declared chain, e.g.
+#                                native -> agent-mail -> fm-send
+#   next <transport> <outcome>   print the next action token for one dispatch attempt,
+#                                resolved against the declared chain, so this command
+#                                loads the config too (see the library header for the
+#                                token grammar)
 #   deadline <accepted-epoch> offline|activation
 #                                print the durable deadline: acceptance time plus the
 #                                configured timeout, computed once
@@ -23,7 +26,7 @@
 # Exit codes: 0 ok; 1 dispatch text refused (check-dispatch only); 2 invalid
 # config, unknown transport/outcome, bad arguments, or unresolvable home.
 # Nothing here sends a message or touches a task; it only answers "what does the
-# approved policy allow next", so a chief and its tests share one definition.
+# declared policy allow next", so a chief and its tests share one definition.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -87,6 +90,7 @@ case "$COMMAND" in
     ;;
   next)
     [ $# -eq 2 ] || refuse 2 "next requires <transport> <outcome>"
+    load_config
     fm_mt_next "$1" "$2" || refuse 2 "$FM_MT_ERROR"
     ;;
   deadline)

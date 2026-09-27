@@ -334,9 +334,12 @@ While the file exists, main's lease-checked commands also take the per-task leas
 
 ## Message transports (config/message-transports.json)
 
-A chief-of-staff home reaches the sessions it coordinates through an ordered chain of transports: native `ListAgents`/`SendMessage` first, Agent Mail second, and this repo's existing `fm-send.sh` route last.
-`config/message-transports.json` expresses that policy and nothing else; the order is fixed, so the loader accepts exactly one shape and fails closed, naming the field, on any other.
-[`docs/examples/message-transports.json`](examples/message-transports.json) is the approved default:
+A chief-of-staff home reaches the sessions it coordinates through a chain of transports it declares in `config/message-transports.json`.
+Native `ListAgents`/`SendMessage` is always the primary, because the outcomes the chain reasons about - a held copy, a copy accepted for an offline session, a delivered copy never activated - are native's own.
+Everything after it is declared: `fallbacks` is any subset of the known fallback adapters, Agent Mail and this repo's existing `fm-send.sh` route, in any order, and it may be empty.
+**No fallback adapter is mandatory.** A home with no Agent Mail configured declares `"fallbacks": ["fm-send"]` and the chain works; a home with neither declares `[]` and the chain begins and ends at native.
+The loader still fails closed, naming the field, on anything outside that: an unknown adapter, `native` named as a fallback, a repeated adapter, a missing `fallbacks` key, an unknown key, or a timeout out of range.
+[`docs/examples/message-transports.json`](examples/message-transports.json) is the fleet default, which uses all three:
 
 ```json
 {
@@ -352,14 +355,18 @@ A chief-of-staff home reaches the sessions it coordinates through an ordered cha
 | --- | --- |
 | `schema_version` | `1` |
 | `primary` | `"native"` |
-| `fallbacks` | `["agent-mail", "fm-send"]`, in that order |
+| `fallbacks` | an array of distinct known fallback adapters (`"agent-mail"`, `"fm-send"`) in the order they should be attempted; may be empty; never `"native"` |
 | `offline_pending_timeout_seconds` | whole seconds, 60-3600; default 600 when omitted |
 | `native_activation_timeout_seconds` | whole seconds, 60-3600; default 600 when omitted |
 
-Any unknown key, a missing or reordered adapter, or a timeout that is zero, negative, fractional, or outside the range is refused before dispatch rather than clamped.
-[`bin/fm-message-transport.sh`](../bin/fm-message-transport.sh) is the command-line face of the policy ([`bin/fm-message-transport-lib.sh`](../bin/fm-message-transport-lib.sh) owns it): `--dry-run` validates and prints `native -> agent-mail -> fm-send`; `next <transport> <outcome>` answers what the policy allows after one attempt; `deadline` computes the durable accepted-offline or activation deadline once from the acceptance time; `check-dispatch` refuses a bare slash command, an unnamed skill, or a missing acknowledgement line before anything is sent.
-Like `fm-send.sh`, the command requires `FM_HOME` (or `FM_CONFIG_OVERRIDE`) to be named rather than guessing a home.
-The two timeouts govern when a native copy that was accepted for an offline session, or delivered but never claimed by the recipient, releases the Agent Mail fallback; a held native copy stays pending until Claude Code's documented terminal hold outcome and never releases a fallback.
+Any unknown key, an unknown or repeated adapter, or a timeout that is zero, negative, fractional, or outside the range is refused before dispatch rather than clamped.
+[`bin/fm-message-transport.sh`](../bin/fm-message-transport.sh) is the command-line face of the policy ([`bin/fm-message-transport-lib.sh`](../bin/fm-message-transport-lib.sh) owns it): `--dry-run` validates and prints the declared chain (`native -> agent-mail -> fm-send` for the default, `native` alone for an empty list); `next <transport> <outcome>` answers what the policy allows after one attempt; `deadline` computes the durable accepted-offline or activation deadline once from the acceptance time; `check-dispatch` refuses a bare slash command, an unnamed skill, or a missing acknowledgement line before anything is sent.
+Like `fm-send.sh`, the command requires `FM_HOME` (or `FM_CONFIG_OVERRIDE`) to be named rather than guessing a home; `next` reads the config too, because the successor of an adapter is a property of the declared chain.
+
+`next` maps each (adapter, outcome) pair to an outcome class - keep waiting, advance, done, or stop - and resolves that class against the declared chain, so the answer follows the config rather than a fixed successor.
+An outcome that advances names the adapter declared after the one that reported it, and `stop:exhausted` when nothing is declared after it, so a chain of any length terminates.
+An adapter the chain does not declare is refused rather than answered: with `"fallbacks": ["fm-send"]`, `next agent-mail pending` exits 2 naming the declared chain.
+The two timeouts govern when a native copy that was accepted for an offline session, or delivered but never claimed by the recipient, releases the next declared fallback; a held native copy stays pending until Claude Code's documented terminal hold outcome and never releases a fallback.
 Nothing in this policy sends a message: the native adapter is owned by the coordinating agent, and `fm-send.sh` keeps its own exit and delivery contract unchanged when the chain reaches it.
 
 ### Dispatch-body broker (dispatch-bodies.sqlite3)

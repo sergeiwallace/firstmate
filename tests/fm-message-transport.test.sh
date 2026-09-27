@@ -4,13 +4,18 @@
 # fail-closed required-backend rule (config/backlog-backend-required) that keeps
 # a chief-of-staff home on its Beads tasks-axi adapter.
 #
-# What these guard: the approved chain native -> agent-mail -> fm-send is the
-# only shape the loader accepts, and every deviation fails closed naming the
-# field, so a dispatch can never start against a reordered, widened, or
-# unbounded policy. The next-step table is total and deterministic over the
-# known outcomes: held never releases a fallback, accepted-offline and an
-# unclaimed native doorbell release Agent Mail only through their deadlines,
-# and ambiguity stops rather than resends. A bare slash command is refused
+# What these guard: the chain is declared in config and validated against the
+# known adapter vocabulary - native is always the primary, and the fallbacks are
+# any subset of the known adapters in any order, including none at all - so an
+# upstream home with no Agent Mail can declare a valid chain while the fleet's
+# own native -> agent-mail -> fm-send config keeps every token it had. Every
+# deviation still fails closed naming the field, so a dispatch can never start
+# against a widened or unbounded policy. The next-step table is total and
+# deterministic over the known outcomes and resolved against the declared chain:
+# held never releases a fallback, accepted-offline and an unclaimed native
+# doorbell release the next declared adapter only through their deadlines, the
+# last adapter in the chain exhausts rather than inventing a successor, and
+# ambiguity stops rather than resends. A bare slash command is refused
 # before any send. And a home that requires the beads adapter refuses every
 # tasks-axi lifecycle operation, rather than writing data/backlog.md, when the
 # resolved adapter is anything else or tasks-axi is missing.
@@ -50,6 +55,11 @@ write_config() {  # <home> <json>
 }
 
 VALID='{"schema_version":1,"primary":"native","fallbacks":["agent-mail","fm-send"],"offline_pending_timeout_seconds":600,"native_activation_timeout_seconds":600}'
+
+# The fleet's own declared chain, used by every next-step test: the table is a
+# property of a declared chain, so `next` needs a loaded policy.
+FLEET_HOME="$TMP_ROOT/fleet"
+write_config "$FLEET_HOME" "$VALID"
 
 # --- loader: the approved shape --------------------------------------------------------------
 
@@ -103,9 +113,11 @@ test_invalid_configs_fail_closed_naming_the_field() {
   expect_invalid "wrong schema version" '{"schema_version":2,"primary":"native","fallbacks":["agent-mail","fm-send"]}' "schema_version"
   expect_invalid "missing schema version" '{"primary":"native","fallbacks":["agent-mail","fm-send"]}' "schema_version"
   expect_invalid "agent-mail as primary" '{"schema_version":1,"primary":"agent-mail","fallbacks":["native","fm-send"]}' "primary"
-  expect_invalid "reordered fallbacks" '{"schema_version":1,"primary":"native","fallbacks":["fm-send","agent-mail"]}' "fallbacks"
   expect_invalid "unknown adapter" '{"schema_version":1,"primary":"native","fallbacks":["agent-mail","carrier-pigeon"]}' "fallbacks"
   expect_invalid "missing fallbacks" '{"schema_version":1,"primary":"native"}' "fallbacks"
+  expect_invalid "native repeated as a fallback" '{"schema_version":1,"primary":"native","fallbacks":["native","fm-send"]}' "fallbacks"
+  expect_invalid "duplicate fallback" '{"schema_version":1,"primary":"native","fallbacks":["fm-send","fm-send"]}' "fallbacks"
+  expect_invalid "non-string fallback entry" '{"schema_version":1,"primary":"native","fallbacks":[1]}' "fallbacks"
   expect_invalid "unknown key" '{"schema_version":1,"primary":"native","fallbacks":["agent-mail","fm-send"],"retry_forever":true}' "retry_forever"
   expect_invalid "offline timeout below range" '{"schema_version":1,"primary":"native","fallbacks":["agent-mail","fm-send"],"offline_pending_timeout_seconds":30}' "offline_pending_timeout_seconds"
   expect_invalid "activation timeout above range" '{"schema_version":1,"primary":"native","fallbacks":["agent-mail","fm-send"],"native_activation_timeout_seconds":3601}' "native_activation_timeout_seconds"
@@ -145,12 +157,16 @@ test_no_home_is_refused_not_guessed() {
 
 # --- next-step decision table ----------------------------------------------------------------
 
+NEXT_HOME=$FLEET_HOME
 expect_next() {  # <transport> <outcome> <token>
-  run 0 "next $1 $2" "$CLI" next "$1" "$2"
+  run 0 "next $1 $2" env FM_HOME="$NEXT_HOME" "$CLI" next "$1" "$2"
   assert_equals "$3" "$OUT" "next $1 $2"
 }
 
+# The fleet's declared chain must keep every token it had: this test is the proof
+# that making the fallbacks configurable changed nothing for the fleet default.
 test_next_step_table_is_deterministic_and_total() {
+  NEXT_HOME=$FLEET_HOME
   expect_next native delivered pending:native-activation
   expect_next native held pending:held
   expect_next native offline pending:native-offline
@@ -167,8 +183,10 @@ test_next_step_table_is_deterministic_and_total() {
   expect_next agent-mail expired fallback:fm-send
   expect_next agent-mail pending pending:agent-mail
   expect_next agent-mail receipt done:agent-mail
+  expect_next agent-mail claimed done:agent-mail
   expect_next agent-mail ambiguous stop:reconcile
   expect_next fm-send sent done:fm-send
+  expect_next fm-send claimed done:fm-send
   expect_next fm-send inconclusive stop:verify-pane
   expect_next fm-send failed stop:exhausted
   expect_next fm-send ambiguous stop:reconcile
@@ -176,17 +194,75 @@ test_next_step_table_is_deterministic_and_total() {
 }
 
 test_held_never_releases_a_fallback() {
-  run 0 "held" "$CLI" next native held
+  run 0 "held" env FM_HOME="$FLEET_HOME" "$CLI" next native held
   assert_not_contains "$OUT" "fallback" "a held native copy must stay pending"
   pass "held stays pending until its documented terminal outcome"
 }
 
 test_unknown_transport_or_outcome_is_refused() {
-  run 2 "unknown outcome" "$CLI" next native teleported
+  run 2 "unknown outcome" env FM_HOME="$FLEET_HOME" "$CLI" next native teleported
   assert_contains "$OUT" "not a known native outcome" "unknown outcome is named"
-  run 2 "unknown transport" "$CLI" next smoke-signal delivered
+  run 2 "unknown transport" env FM_HOME="$FLEET_HOME" "$CLI" next smoke-signal delivered
   assert_contains "$OUT" "not one of native, agent-mail, fm-send" "unknown transport is named"
   pass "an unknown transport or outcome is refused, never guessed"
+}
+
+# --- the chain is declared, and no fallback adapter is mandatory --------------------------------
+
+test_a_config_without_agent_mail_is_valid_and_routes_around_it() {
+  local home="$TMP_ROOT/no-agent-mail"
+  write_config "$home" '{"schema_version":1,"primary":"native","fallbacks":["fm-send"]}'
+  run 0 "dry-run without agent-mail" env FM_HOME="$home" "$CLI" --dry-run
+  assert_equals "native -> fm-send" "$OUT" "a home with no Agent Mail declares a two-step chain"
+  NEXT_HOME=$home
+  expect_next native refused fallback:fm-send
+  expect_next native offline-timeout fallback:fm-send:native-timeout
+  expect_next native held pending:held
+  expect_next fm-send failed stop:exhausted
+  run 2 "agent-mail is not in this chain" env FM_HOME="$home" "$CLI" next agent-mail pending
+  assert_contains "$OUT" "not in the declared chain" "an undeclared adapter is refused, not silently answered"
+  NEXT_HOME=$FLEET_HOME
+  pass "a config that omits agent-mail is valid and the table routes around it"
+}
+
+test_an_empty_fallback_list_is_valid_and_exhausts_at_native() {
+  local home="$TMP_ROOT/no-fallbacks"
+  write_config "$home" '{"schema_version":1,"primary":"native","fallbacks":[]}'
+  run 0 "dry-run with no fallbacks" env FM_HOME="$home" "$CLI" --dry-run
+  assert_equals "native" "$OUT" "a native-only chain prints just native"
+  NEXT_HOME=$home
+  expect_next native refused stop:exhausted
+  expect_next native held pending:held
+  expect_next native claimed done:native
+  NEXT_HOME=$FLEET_HOME
+  pass "an empty fallback list is valid and exhausts at native"
+}
+
+test_declared_order_is_dispatch_order() {
+  local home="$TMP_ROOT/reordered"
+  write_config "$home" '{"schema_version":1,"primary":"native","fallbacks":["fm-send","agent-mail"]}'
+  run 0 "dry-run with a reordered chain" env FM_HOME="$home" "$CLI" --dry-run
+  assert_equals "native -> fm-send -> agent-mail" "$OUT" "the declared order is the printed order"
+  NEXT_HOME=$home
+  expect_next native refused fallback:fm-send
+  expect_next fm-send failed fallback:agent-mail
+  expect_next agent-mail expired stop:exhausted
+  NEXT_HOME=$FLEET_HOME
+  pass "declared order is dispatch order, and the last adapter exhausts"
+}
+
+test_next_without_a_loaded_policy_is_refused() {
+  local home="$TMP_ROOT/next-no-config"
+  mkdir -p "$home/config"
+  run 2 "next with no config present" env FM_HOME="$home" "$CLI" next native refused
+  assert_contains "$OUT" "missing or unreadable" "next fails closed on an unloadable policy"
+  run 2 "next with no home named" env -u FM_HOME -u FM_CONFIG_OVERRIDE "$CLI" next native refused
+  assert_contains "$OUT" "FM_HOME is unset" "next refuses to guess a home"
+  run 2 "library next before any load" bash -c \
+    '. "$1"; fm_mt_next native refused; rc=$?; printf "%s\n" "$FM_MT_ERROR"; exit "$rc"' \
+    _ "$ROOT/bin/fm-message-transport-lib.sh"
+  assert_contains "$OUT" "load the transport config" "the library names the unloaded policy"
+  pass "next is refused without a loadable declared chain"
 }
 
 # --- durable deadlines ------------------------------------------------------------------------
@@ -347,6 +423,10 @@ test_no_home_is_refused_not_guessed
 test_next_step_table_is_deterministic_and_total
 test_held_never_releases_a_fallback
 test_unknown_transport_or_outcome_is_refused
+test_a_config_without_agent_mail_is_valid_and_routes_around_it
+test_an_empty_fallback_list_is_valid_and_exhausts_at_native
+test_declared_order_is_dispatch_order
+test_next_without_a_loaded_policy_is_refused
 test_deadline_is_acceptance_plus_configured_timeout
 test_templated_dispatch_passes
 test_bare_slash_command_is_refused
