@@ -1,28 +1,34 @@
 #!/usr/bin/env bash
 # Behavior tests for the VP-owner authority layer (bin/fm-vp-owner.py): signer
-# identity, the root-signed trust registry, signed owner records, and owner-route
-# resolution.
+# identity, unattended self-provisioning, self-verifying owner records, and
+# owner-route resolution.
 #
-# What these guard: nothing about VP ownership is self-asserted. A key id is the
-# SHA-256 of its own public key, so a registry cannot bind a key id to someone
-# else's key. A trust registry is trusted only when a detached signature by an
-# explicitly named root key verifies its exact canonical bytes, it has not
-# expired, and its revision is newer than the installed one; installation is
-# atomic and a refused install leaves the installed file byte-identical. An owner
-# record verifies only as byte-for-byte canonical JSON, under Ed25519, against a
-# current registry binding whose machine and chief identity match the payload and
-# whose signing-time window covers signed_at, and only while the record's
-# provenance revision is no newer than the installed registry. Every rejection
-# names the failed trust check and exits 4; bad input and an unresolved route exit
-# 2; a rolled-back install exits 3. An owner route resolves to exactly one row or
-# to forwarding-blocked, never to a direct VP target.
+# What these guard: a document that claims to be an owner record either is one or
+# is rejected by name. A key id is the SHA-256 of its own public key, and the
+# record carries that public key, so a record cannot name one key id while
+# carrying another key's material. An owner record verifies only as byte-for-byte
+# canonical JSON, under Ed25519, with a chief_instance_key that derives from its
+# own owner_machine_key. Those document-validity failures exit 4 and name the
+# failed check; bad input and an unresolved route exit 2.
+#
+# What these deliberately do NOT guard: that the asserted machine key is this
+# machine's. Ownership is self-asserted (see the tool's header). There is no
+# expiry, no registry, no revocation and no signing window, so nothing here can
+# refuse a well-formed record for a trust reason. The one identity expectation a
+# caller can express, --expected-owner-machine-key, is a soft warning that still
+# exits 0, and a test below pins exactly that.
+#
+# self-provision is the unattended install path, so its tests are the
+# self-healing ones: every way its state can be missing, garbage, or hand-edited
+# heals and exits 0, naming what it healed in JSON and on stderr.
 #
 # Positive controls run first in every group, so a refuse-everything
-# implementation cannot pass: a valid record verifies, a valid registry installs,
-# a good route resolves, and the signature and key id are recomputed here
-# independently of the tool. Every command runs as a subprocess against real
-# files and a real openssl in a fresh private temp home. No privileged path is
-# written: the /etc and /var guards are proved with path strings only.
+# implementation cannot pass: a valid record verifies, a good route resolves, a
+# second self-provision run is a no-op, and the signature and key id are
+# recomputed here independently of the tool. Every command runs as a subprocess
+# against real files and a real openssl in a fresh private temp home. No
+# privileged path is written: the /etc and /var guards are proved with path
+# strings only.
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
@@ -38,6 +44,7 @@ openssl genpkey -algorithm ed25519 -out "$TMP_ROOT/probe.pem" 2>/dev/null ||
 
 # run <expected-exit> <label> <cmd...>: capture combined output into OUT, exit into RC.
 OUT=
+ERR=
 RC=0
 run() {
   local expected=$1 label=$2
@@ -47,9 +54,22 @@ run() {
   RC=$?
   expect_code "$expected" "$RC" "$label"
 }
+
+# run_split <expected-exit> <label> <cmd...>: stdout into OUT, stderr into ERR.
+# Needed wherever a command prints one JSON object on stdout AND warnings on
+# stderr: combining the two streams would make the JSON unparseable.
+run_split() {
+  local expected=$1 label=$2
+  shift 2
+  set +e
+  OUT=$("$@" 2>"$TMP_ROOT/.stderr")
+  RC=$?
+  ERR=$(cat "$TMP_ROOT/.stderr")
+  expect_code "$expected" "$RC" "$label"
+}
 set +e
 
-# json <path-expr> reads one field from $OUT: json signers.0.status
+# json <path-expr> reads one field from $OUT: json healed.0
 json() {
   printf '%s' "$OUT" | python3 -c '
 import json, sys
@@ -71,71 +91,15 @@ print(obj if not isinstance(obj, (dict, list)) else json.dumps(obj, sort_keys=Tr
 ' "$1" "$2"
 }
 
+mode_of() {  # <path> -> the octal permission bits, on Linux or macOS
+  stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"
+}
+
 new_dir() {  # <name> -> a fresh private directory
   local dir="$TMP_ROOT/$1"
   mkdir -p "$dir"
   chmod 700 "$dir"
   printf '%s\n' "$dir"
-}
-
-# --- one fleet root and two machine signers, generated once with real openssl ----------------------
-
-KEYS=$(new_dir keys)
-ROOT_KEY="$KEYS/root.pem"
-ROOT_PUB="$KEYS/root.pub"
-openssl genpkey -algorithm ed25519 -out "$ROOT_KEY" 2>/dev/null || fail "could not generate the fleet root key"
-openssl pkey -in "$ROOT_KEY" -pubout -out "$ROOT_PUB" 2>/dev/null || fail "could not export the fleet root public key"
-
-MK1_DIR=$(new_dir keys-mk-1)
-MK2_DIR=$(new_dir keys-mk-2)
-run 0 "keygen mk-1" python3 "$TOOL" keygen --key-dir "$MK1_DIR/vp-owner"
-KEY1=$(json key_id); PUB1=$(json public_key); PRIV1=$(json private_key_path)
-run 0 "keygen mk-2" python3 "$TOOL" keygen --key-dir "$MK2_DIR/vp-owner"
-KEY2=$(json key_id); PUB2=$(json public_key); PRIV2=$(json private_key_path)
-
-# signer <key_id> <public_key> <machine_key> <chief_instance_key> <status> <not_before> <not_after|-> <revoked_at|->
-signer() {
-  printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
-}
-
-# registry <out> <revision> <issued_at> <expires_at> <signer-spec...>: write canonical JSON.
-registry() {
-  local out=$1
-  shift
-  python3 - "$@" > "$out" <<'PY'
-import json, sys
-rev, issued, expires = int(sys.argv[1]), sys.argv[2], sys.argv[3]
-signers = []
-for spec in sys.argv[4:]:
-    key_id, pub, machine, chief, status, nb, na, rev_at = spec.split("|")
-    signers.append({
-        "key_id": key_id, "public_key": pub, "machine_key": machine,
-        "chief_instance_key": chief, "status": status, "not_before": nb,
-        "not_after": None if na == "-" else na,
-        "revoked_at": None if rev_at == "-" else rev_at,
-        "supersedes": None,
-    })
-doc = {"schema_version": 1, "registry_revision": rev, "issued_at": issued,
-       "expires_at": expires, "signers": signers}
-sys.stdout.write(json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n")
-PY
-}
-
-# good_registry <out> <revision>: revision N binding mk-1 active with a wide window.
-good_registry() {
-  registry "$1" "$2" 2026-09-01T00:00:00Z 2027-09-01T00:00:00Z \
-    "$(signer "$KEY1" "$PUB1" mk-1 firstmate-chief/mk-1 active 2026-09-01T00:00:00Z - -)"
-  run 0 "root-sign revision $2" python3 "$TOOL" registry-sign --registry "$1" --root-key "$ROOT_KEY"
-}
-
-# sign_record <out> <provenance-revision> <epoch> <signed_at> [extra sign-owner args...]
-sign_record() {
-  local out=$1 revision=$2 epoch=$3 signed_at=$4
-  shift 4
-  python3 "$TOOL" sign-owner --private-key "$PRIV1" --vp-id vp/ai-harness/primary \
-    --owner-machine-key mk-1 --owner-epoch "$epoch" --chief-instance-key firstmate-chief/mk-1 \
-    --ownership-state active --trust-registry-revision "$revision" --signed-at "$signed_at" \
-    --out "$out" "$@"
 }
 
 # mutate <in> <out> <python-body>: rewrite a JSON document; `doc` is the parsed object,
@@ -154,14 +118,32 @@ open(dst, "wb").write(raw)
 PY
 }
 
+# --- two machine signers, generated once with real openssl -----------------------------------------
+
+MK1_DIR=$(new_dir keys-mk-1)
+MK2_DIR=$(new_dir keys-mk-2)
+run 0 "keygen mk-1" python3 "$TOOL" keygen --key-dir "$MK1_DIR/vp-owner"
+KEY1=$(json key_id); PUB1=$(json public_key); PRIV1=$(json private_key_path)
+run 0 "keygen mk-2" python3 "$TOOL" keygen --key-dir "$MK2_DIR/vp-owner"
+KEY2=$(json key_id); PUB2=$(json public_key); PRIV2=$(json private_key_path)
+
+# sign_record <out> <epoch> <signed_at> [extra sign-owner args...]
+sign_record() {
+  local out=$1 epoch=$2 signed_at=$3
+  shift 3
+  python3 "$TOOL" sign-owner --private-key "$PRIV1" --vp-id vp/ai-harness/primary \
+    --owner-machine-key mk-1 --owner-epoch "$epoch" --chief-instance-key firstmate-chief/mk-1 \
+    --ownership-state active --signed-at "$signed_at" --out "$out" "$@"
+}
+
 # --- keygen: a content-addressed identity, never a privileged write -------------------------------
 
 test_keygen_creates_a_private_key_whose_id_is_the_hash_of_its_own_public_key() {
   local dir recomputed
   dir=$(new_dir keygen)
   run 0 "keygen" python3 "$TOOL" keygen --key-dir "$dir/vp-owner"
-  assert_equals 700 "$(stat -c %a "$dir/vp-owner" 2>/dev/null || stat -f %Lp "$dir/vp-owner")" "key dir is 0700"
-  assert_equals 600 "$(stat -c %a "$(json private_key_path)" 2>/dev/null || stat -f %Lp "$(json private_key_path)")" "private key is 0600"
+  assert_equals 700 "$(mode_of "$dir/vp-owner")" "key dir is 0700"
+  assert_equals 600 "$(mode_of "$(json private_key_path)")" "private key is 0600"
   assert_not_contains "$OUT" "PRIVATE KEY" "keygen never prints private key material"
   assert_equals "$dir/vp-owner/$(json key_id).key" "$(json private_key_path)" "the key file is named by its key id"
   # Positive control on the identity contract, recomputed here from the private key.
@@ -201,193 +183,192 @@ test_keygen_refuses_a_privileged_or_unowned_directory_without_writing() {
   pass "keygen refuses an installer-owned, unowned, or shared directory and writes nothing there"
 }
 
-# --- enrollment: proof of possession a human verifies out of band ----------------------------------
+# --- self-provision: the unattended install path, self-healing in every direction ------------------
 
-test_enroll_request_is_canonical_and_its_proof_of_possession_verifies() {
-  local dir verified
-  dir=$(new_dir enroll)
-  run 0 "enroll-request" python3 "$TOOL" --now 2026-09-26T10:00:00Z enroll-request \
-    --private-key "$PRIV1" --machine-key mk-1 --chief-instance-key firstmate-chief/mk-1 \
-    --nonce enroll-nonce-1 --out "$dir/enroll.json"
-  assert_equals "$KEY1" "$(json key_id)" "the request names the key id of the key that signed it"
-  assert_contains "$OUT" "non-dispatching until a human" "the request says the machine stays non-dispatching"
-  assert_equals enroll-nonce-1 "$(file_json "$dir/enroll.json" nonce)" "the one-use nonce is carried"
-  assert_equals "$PUB1" "$(file_json "$dir/enroll.json" public_key)" "the public key is carried"
-  # Positive control: verify the proof of possession here, with openssl, over the
-  # canonical request minus its signature field.
-  verified=$(python3 - "$dir/enroll.json" "$dir" <<'PY'
-import base64, json, subprocess, sys
-doc = json.load(open(sys.argv[1]))
-work = sys.argv[2]
-sig = doc.pop("proof_of_possession")
-msg = b"ai-harness/vp-owner-enroll/v1\0" + json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-raw = base64.urlsafe_b64decode(doc["public_key"] + "=" * (-len(doc["public_key"]) % 4))
-open(work + "/p.der", "wb").write(bytes.fromhex("302a300506032b6570032100") + raw)
-open(work + "/m", "wb").write(msg)
-open(work + "/s", "wb").write(base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4)))
-rc = subprocess.run(["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", work + "/p.der", "-keyform", "DER",
-                     "-rawin", "-in", work + "/m", "-sigfile", work + "/s"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
-print("verified" if rc == 0 else "failed")
+test_self_provision_creates_a_signer_identity_unattended_and_never_prints_the_key() {
+  local dir recomputed
+  dir=$(new_dir provision)
+  run_split 0 "positive control: first provision" python3 "$TOOL" --now 2026-09-27T10:00:00Z \
+    self-provision --state-dir "$dir/vp-owner" --machine-key mk-1
+  assert_equals True "$(json provisioned)" "the machine is provisioned"
+  assert_equals mk-1 "$(json machine_key)" "the caller-supplied machine key is carried"
+  assert_equals firstmate-chief/mk-1 "$(json chief_instance_key)" "the chief instance key derives from the machine key"
+  assert_equals '["key-generated"]' "$(json healed)" "a first provision generates the one key it needs"
+  assert_contains "$ERR" "warning: key-generated" "the generated key is warned about on stderr"
+  assert_not_contains "$OUT" "PRIVATE KEY" "self-provision never prints private key material"
+  assert_not_contains "$ERR" "PRIVATE KEY" "self-provision never warns with private key material"
+  assert_equals 700 "$(mode_of "$dir/vp-owner")" "the state directory is 0700"
+  assert_equals 700 "$(mode_of "$dir/vp-owner/keys")" "the key directory is 0700"
+  assert_equals 600 "$(mode_of "$(json key_path)")" "the private key is 0600"
+  assert_equals 600 "$(mode_of "$dir/vp-owner/self.json")" "self.json is 0600"
+  assert_equals "$dir/vp-owner/self.json" "$(json self_path)" "the self record path is reported"
+  assert_equals 1 "$(file_json "$dir/vp-owner/self.json" schema_version)" "self.json carries its schema version"
+  assert_equals 2026-09-27T10:00:00Z "$(file_json "$dir/vp-owner/self.json" provisioned_at)" "the provisioning instant is recorded"
+  # Positive control: self.json is byte-for-byte canonical JSON plus one LF, and its
+  # identity fields are the openssl-recomputed identity of the key on disk.
+  recomputed=$(python3 - "$dir/vp-owner/self.json" "$(json key_path)" <<'PY'
+import base64, hashlib, json, subprocess, sys
+raw = open(sys.argv[1], "rb").read()
+doc = json.loads(raw)
+canonical = (json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+der = subprocess.run(["openssl", "pkey", "-in", sys.argv[2], "-pubout", "-outform", "DER"],
+                     stdout=subprocess.PIPE, check=True).stdout
+pub = der[12:]
+print("canonical" if raw == canonical else "not-canonical",
+      "key-id-ok" if doc["key_id"] == "ed25519-sha256:" + hashlib.sha256(pub).hexdigest() else "key-id-wrong",
+      "public-key-ok" if doc["public_key"] == base64.urlsafe_b64encode(pub).decode().rstrip("=") else "public-key-wrong")
 PY
 )
-  assert_equals verified "$verified" "the proof of possession verifies under the enrolled public key"
-  # The same check over a request whose machine key was edited must fail.
-  mutate "$dir/enroll.json" "$dir/edited.json" 'doc["machine_key"] = "mk-9"'
-  verified=$(python3 - "$dir/edited.json" "$dir" <<'PY'
-import base64, json, subprocess, sys
-doc = json.load(open(sys.argv[1]))
-work = sys.argv[2]
-sig = doc.pop("proof_of_possession")
-msg = b"ai-harness/vp-owner-enroll/v1\0" + json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-open(work + "/m2", "wb").write(msg)
-open(work + "/s2", "wb").write(base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4)))
-rc = subprocess.run(["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", work + "/p.der", "-keyform", "DER",
-                     "-rawin", "-in", work + "/m2", "-sigfile", work + "/s2"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
-print("verified" if rc == 0 else "failed")
-PY
-)
-  assert_equals failed "$verified" "an edited enrollment request no longer proves possession"
-  pass "an enrollment request is canonical, carries its nonce and public key, and proves possession of the new key"
+  assert_equals "canonical key-id-ok public-key-ok" "$recomputed" "self.json is canonical and names the identity of the key on disk"
+  # And the identity it wrote is usable as a signing identity with no further argument.
+  run 0 "the provisioned identity signs" python3 "$TOOL" --now 2026-09-27T11:00:00Z sign-owner \
+    --state-dir "$dir/vp-owner" --vp-id vp/ai-harness/primary --owner-machine-key mk-1 \
+    --owner-epoch 1 --chief-instance-key firstmate-chief/mk-1 --ownership-state active \
+    --out "$dir/owner.json"
+  assert_equals "$(file_json "$dir/vp-owner/self.json" key_id)" "$(json key_id)" "the record is signed by the provisioned key"
+  run 0 "and that record verifies" python3 "$TOOL" verify-owner --record "$dir/owner.json"
+  assert_equals True "$(json verified)" "the provisioned identity produces a verifiable record"
+  pass "self-provision creates a 0600 key and a canonical 0600 self.json in a 0700 directory, prints no key material, and yields a usable signing identity"
 }
 
-# --- trust registry ------------------------------------------------------------------------------
+test_a_second_self_provision_run_changes_nothing() {
+  local dir first_key first_sha
+  dir=$(new_dir provision-idempotent)
+  run_split 0 "first provision" python3 "$TOOL" --now 2026-09-27T10:00:00Z \
+    self-provision --state-dir "$dir/vp-owner" --machine-key mk-1
+  first_key=$(json key_id)
+  first_sha=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$dir/vp-owner/self.json")
+  run_split 0 "second provision" python3 "$TOOL" --now 2026-09-27T12:00:00Z \
+    self-provision --state-dir "$dir/vp-owner" --machine-key mk-1
+  assert_equals '[]' "$(json healed)" "a healthy second run heals nothing"
+  assert_equals "" "$ERR" "a healthy second run warns about nothing"
+  assert_equals "$first_key" "$(json key_id)" "the key id is unchanged"
+  assert_equals "$first_sha" "$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$dir/vp-owner/self.json")" "self.json is byte-identical, so provisioned_at was not churned"
+  assert_equals 1 "$(find "$dir/vp-owner/keys" -name '*.key' | wc -l | tr -d ' ')" "no second key was generated"
+  pass "self-provision is idempotent: a healthy second run generates no key, rewrites nothing, and heals nothing"
+}
 
-test_a_root_signed_registry_verifies_and_any_local_edit_does_not() {
+test_self_provision_heals_a_deleted_or_garbage_self_record_by_adopting_the_existing_key() {
+  local dir first_key
+  dir=$(new_dir provision-heal-self)
+  run_split 0 "first provision" python3 "$TOOL" --now 2026-09-27T10:00:00Z \
+    self-provision --state-dir "$dir/vp-owner" --machine-key mk-1
+  first_key=$(json key_id)
+
+  rm -f "$dir/vp-owner/self.json"
+  run_split 0 "a deleted self.json heals" python3 "$TOOL" --now 2026-09-27T12:00:00Z \
+    self-provision --state-dir "$dir/vp-owner" --machine-key mk-1
+  assert_equals '["self-missing"]' "$(json healed)" "the missing self record is named"
+  assert_contains "$ERR" "warning: self-missing" "the heal is warned about on stderr"
+  assert_equals "$first_key" "$(json key_id)" "the existing key was adopted rather than replaced"
+  assert_present "$dir/vp-owner/self.json" "self.json is back"
+
+  printf 'not json at all\x00\xff' > "$dir/vp-owner/self.json"
+  run_split 0 "garbage bytes heal" python3 "$TOOL" --now 2026-09-27T13:00:00Z \
+    self-provision --state-dir "$dir/vp-owner" --machine-key mk-1
+  assert_equals '["self-unparseable"]' "$(json healed)" "the unparseable self record is named"
+  assert_contains "$ERR" "warning: self-unparseable" "the unparseable heal is warned about on stderr"
+  assert_equals "$first_key" "$(json key_id)" "garbage in self.json never costs the machine its key"
+  assert_equals 1 "$(find "$dir/vp-owner/keys" -name '*.key' | wc -l | tr -d ' ')" "still exactly one key"
+  pass "a deleted or unparseable self.json regenerates from the key on disk instead of refusing or minting a new identity"
+}
+
+test_self_provision_heals_a_self_record_naming_a_key_that_is_not_there() {
+  local dir first_key
+  dir=$(new_dir provision-heal-key)
+  run_split 0 "first provision" python3 "$TOOL" --now 2026-09-27T10:00:00Z \
+    self-provision --state-dir "$dir/vp-owner" --machine-key mk-1
+  first_key=$(json key_id)
+  mutate "$dir/vp-owner/self.json" "$dir/vp-owner/self.json" \
+    'doc["key_id"] = "ed25519-sha256:" + "0" * 64'
+  run_split 0 "a self.json naming an absent key heals" python3 "$TOOL" --now 2026-09-27T12:00:00Z \
+    self-provision --state-dir "$dir/vp-owner" --machine-key mk-1
+  assert_equals '["self-key-missing"]' "$(json healed)" "the absent key is named"
+  assert_contains "$ERR" "warning: self-key-missing" "the heal is warned about on stderr"
+  assert_equals "$first_key" "$(json key_id)" "the key that is actually on disk is adopted"
+  assert_equals "$first_key" "$(file_json "$dir/vp-owner/self.json" key_id)" "self.json is rewritten to the adopted key"
+  assert_equals 1 "$(find "$dir/vp-owner/keys" -name '*.key' | wc -l | tr -d ' ')" "adoption did not mint a second key"
+  pass "a self.json naming a key that is not on disk adopts the key that is, rather than refusing or minting a new identity"
+}
+
+test_self_provision_heals_a_hand_edited_machine_key_and_public_key() {
+  local dir first_key
+  dir=$(new_dir provision-heal-edits)
+  run_split 0 "first provision" python3 "$TOOL" --now 2026-09-27T10:00:00Z \
+    self-provision --state-dir "$dir/vp-owner" --machine-key mk-1
+  first_key=$(json key_id)
+
+  mutate "$dir/vp-owner/self.json" "$dir/vp-owner/self.json" \
+    'doc["machine_key"] = "mk-9"; doc["chief_instance_key"] = "firstmate-chief/mk-9"'
+  run_split 0 "a hand-edited machine key heals" python3 "$TOOL" --now 2026-09-27T12:00:00Z \
+    self-provision --state-dir "$dir/vp-owner" --machine-key mk-1
+  assert_equals '["self-machine-key"]' "$(json healed)" "the disagreeing machine key is named"
+  assert_contains "$ERR" "warning: self-machine-key" "the heal is warned about on stderr"
+  assert_contains "$ERR" mk-9 "the warning names the value it replaced"
+  assert_equals mk-1 "$(file_json "$dir/vp-owner/self.json" machine_key)" "the argument wins over the file"
+  assert_equals firstmate-chief/mk-1 "$(file_json "$dir/vp-owner/self.json" chief_instance_key)" "the chief key is re-derived"
+
+  # A key id that names a key file that IS there, with the wrong public key beside it.
+  cp "$PRIV2" "$dir/vp-owner/keys/$KEY2.key"
+  mutate "$dir/vp-owner/self.json" "$dir/vp-owner/self.json" \
+    "doc['key_id'] = '$KEY2'"
+  run_split 0 "a hand-edited key id heals" python3 "$TOOL" --now 2026-09-27T13:00:00Z \
+    self-provision --state-dir "$dir/vp-owner" --machine-key mk-1
+  assert_equals '["self-key-id"]' "$(json healed)" "the disagreeing key id is named"
+  assert_contains "$ERR" "warning: self-key-id" "the heal is warned about on stderr"
+  assert_equals "$KEY2" "$(file_json "$dir/vp-owner/self.json" key_id)" "the key id that names a real key file is kept"
+  assert_equals "$PUB2" "$(file_json "$dir/vp-owner/self.json" public_key)" "the public key is rewritten from the key on disk"
+  run_split 0 "and the healed state is then stable" python3 "$TOOL" --now 2026-09-27T14:00:00Z \
+    self-provision --state-dir "$dir/vp-owner" --machine-key mk-1
+  assert_equals '[]' "$(json healed)" "healing converges: the next run heals nothing"
+  pass "a hand-edited machine key or public key is rewritten from the argument and the key on disk, each heal named in JSON and on stderr, and healing converges"
+}
+
+test_self_provision_tightens_a_shared_state_directory_and_drops_legacy_fields() {
   local dir
-  dir=$(new_dir registry)
-  good_registry "$dir/vp-owner-trust.json" 3
-  run 0 "positive control: verify" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-verify \
-    --registry "$dir/vp-owner-trust.json" --root-pub "$ROOT_PUB"
-  assert_equals True "$(json verified)" "a root-signed registry verifies"
-  assert_equals 3 "$(json registry_revision)" "the revision is reported"
-  assert_equals active "$(json signers.0.status)" "the binding status is reported"
+  dir=$(new_dir provision-mode)
+  run_split 0 "first provision" python3 "$TOOL" --now 2026-09-27T10:00:00Z \
+    self-provision --state-dir "$dir/vp-owner" --machine-key mk-1
+  chmod 755 "$dir/vp-owner"
+  run_split 0 "a group-readable state directory heals" python3 "$TOOL" --now 2026-09-27T12:00:00Z \
+    self-provision --state-dir "$dir/vp-owner" --machine-key mk-1
+  assert_equals '["state-dir-mode"]' "$(json healed)" "the loosened mode is named"
+  assert_contains "$ERR" "warning: state-dir-mode" "the mode heal is warned about on stderr"
+  assert_equals 700 "$(mode_of "$dir/vp-owner")" "the directory was tightened rather than refused"
 
-  mutate "$dir/vp-owner-trust.json" "$dir/edited.json" 'doc["signers"][0]["machine_key"] = "mk-9"'
-  cp "$dir/vp-owner-trust.json.sig" "$dir/edited.json.sig"
-  run 4 "locally edited registry" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-verify \
-    --registry "$dir/edited.json" --root-pub "$ROOT_PUB"
-  assert_equals registry-signature "$(json failed_check)" "an edited registry fails the root signature check"
+  # A self.json carrying the retired expiry and registry fields is accepted and
+  # rewritten without them: legacy state never blocks an install.
+  mutate "$dir/vp-owner/self.json" "$dir/vp-owner/self.json" \
+    'doc["expires_at"] = "2027-01-01T00:00:00Z"; doc["trust_registry_revision"] = 4'
+  run_split 0 "legacy fields heal" python3 "$TOOL" --now 2026-09-27T13:00:00Z \
+    self-provision --state-dir "$dir/vp-owner" --machine-key mk-1
+  assert_equals 6 "$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))))' "$dir/vp-owner/self.json")" \
+    "the rewritten self.json carries exactly its six fields"
+  assert_not_contains "$(cat "$dir/vp-owner/self.json")" "2027-01-01" "the retired expiry field is gone"
 
-  rm -f "$dir/edited.json.sig"
-  run 2 "unsigned registry" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-verify \
-    --registry "$dir/edited.json" --root-pub "$ROOT_PUB"
-  assert_contains "$OUT" "not a readable file" "a missing detached signature is refused"
-
-  mutate "$dir/vp-owner-trust.json" "$dir/pretty.json" \
-    'raw = (__import__("json").dumps(doc, indent=2) + "\n").encode()'
-  cp "$dir/vp-owner-trust.json.sig" "$dir/pretty.json.sig"
-  run 4 "non-canonical whitespace" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-verify \
-    --registry "$dir/pretty.json" --root-pub "$ROOT_PUB"
-  assert_equals registry-canonical-serialization "$(json failed_check)" "re-indented JSON is not canonical"
-
-  registry "$dir/expired.json" 3 2026-01-01T00:00:00Z 2026-02-01T00:00:00Z \
-    "$(signer "$KEY1" "$PUB1" mk-1 firstmate-chief/mk-1 active 2026-01-01T00:00:00Z - -)"
-  run 0 "sign the expired registry" python3 "$TOOL" registry-sign --registry "$dir/expired.json" --root-key "$ROOT_KEY"
-  run 4 "expired registry" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-verify \
-    --registry "$dir/expired.json" --root-pub "$ROOT_PUB"
-  assert_equals registry-expired "$(json failed_check)" "an expired registry is refused even though it is root-signed"
-
-  registry "$dir/dup.json" 4 2026-09-01T00:00:00Z 2027-09-01T00:00:00Z \
-    "$(signer "$KEY1" "$PUB1" mk-1 firstmate-chief/mk-1 active 2026-09-01T00:00:00Z - -)" \
-    "$(signer "$KEY1" "$PUB1" mk-1 firstmate-chief/mk-1 active 2026-09-01T00:00:00Z - -)"
-  run 0 "sign the duplicate registry" python3 "$TOOL" registry-sign --registry "$dir/dup.json" --root-key "$ROOT_KEY"
-  run 4 "duplicate binding" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-verify \
-    --registry "$dir/dup.json" --root-pub "$ROOT_PUB"
-  assert_equals registry-duplicate-binding "$(json failed_check)" "a duplicate binding is invalid"
-
-  registry "$dir/swapped.json" 4 2026-09-01T00:00:00Z 2027-09-01T00:00:00Z \
-    "$(signer "$KEY1" "$PUB2" mk-1 firstmate-chief/mk-1 active 2026-09-01T00:00:00Z - -)"
-  run 0 "sign the swapped registry" python3 "$TOOL" registry-sign --registry "$dir/swapped.json" --root-key "$ROOT_KEY"
-  run 4 "key id bound to another key" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-verify \
-    --registry "$dir/swapped.json" --root-pub "$ROOT_PUB"
-  assert_equals registry-key-id-mismatch "$(json failed_check)" "a key id must be the hash of the key it is bound to"
-
-  # Another root, given as PEM and again as one line of unpadded base64url, so both
-  # accepted root-key formats are proved to be read rather than rejected as garbage.
-  openssl pkey -in "$PRIV1" -pubout -out "$dir/other-root.pem" 2>/dev/null
-  printf '%s\n' "$PUB1" > "$dir/other-root.b64u"
-  run 4 "another root (PEM)" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-verify \
-    --registry "$dir/vp-owner-trust.json" --root-pub "$dir/other-root.pem"
-  assert_equals registry-signature "$(json failed_check)" "a registry signed by another root does not verify"
-  run 4 "another root (base64url)" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-verify \
-    --registry "$dir/vp-owner-trust.json" --root-pub "$dir/other-root.b64u"
-  assert_equals registry-signature "$(json failed_check)" "a base64url root key is read, and the wrong root still fails"
-  run 2 "a root public key that is not a key" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-verify \
-    --registry "$dir/vp-owner-trust.json" --root-pub "$dir/vp-owner-trust.json"
-  assert_contains "$OUT" "not a PEM, DER, or base64url" "a file that is not a public key is refused"
-  pass "a registry is trusted only when the named root signs its exact canonical bytes, it is unexpired, and every binding is unique and self-consistent"
-}
-
-test_registry_install_is_atomic_and_a_rollback_leaves_the_installed_file_untouched() {
-  local dir into installed_sha
-  dir=$(new_dir install)
-  into="$dir/installed"
-  good_registry "$dir/rev3.json" 3
-  good_registry "$dir/rev4.json" 4
-  run 0 "positive control: first install" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-install \
-    --registry "$dir/rev3.json" --root-pub "$ROOT_PUB" --into "$into"
-  assert_equals True "$(json installed)" "the first install succeeds"
-  assert_equals absent "$(json previous_state)" "the first install reports no previous registry"
-  assert_present "$into/vp-owner-trust.json" "the registry is installed under its canonical name"
-  assert_present "$into/vp-owner-trust.json.sig" "the detached signature is installed beside it"
-  assert_equals 3 "$(file_json "$into/vp-owner-trust.json" registry_revision)" "revision 3 is installed"
-
-  run 0 "ordinary newer revision installs" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-install \
-    --registry "$dir/rev4.json" --root-pub "$ROOT_PUB" --into "$into"
-  assert_equals 3 "$(json previous_registry_revision)" "the install names the revision it replaced"
-  assert_equals verified "$(json previous_state)" "the replaced registry had itself verified"
-  assert_equals 4 "$(file_json "$into/vp-owner-trust.json" registry_revision)" "revision 4 is installed"
-  installed_sha=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$into/vp-owner-trust.json")
-
-  run 3 "rollback to revision 3" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-install \
-    --registry "$dir/rev3.json" --root-pub "$ROOT_PUB" --into "$into"
-  assert_equals registry-rolled-back "$(json failed_check)" "the rollback is named"
-  assert_equals 4 "$(file_json "$into/vp-owner-trust.json" registry_revision)" "a refused rollback leaves revision 4 installed"
-  assert_equals "$installed_sha" "$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$into/vp-owner-trust.json")" "the installed bytes are unchanged"
-
-  run 3 "re-installing the same revision" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-install \
-    --registry "$dir/rev4.json" --root-pub "$ROOT_PUB" --into "$into"
-  assert_equals registry-rolled-back "$(json failed_check)" "the revision must strictly increase"
-
-  mutate "$dir/rev4.json" "$dir/rev5-edited.json" 'doc["registry_revision"] = 5'
-  cp "$dir/rev4.json.sig" "$dir/rev5-edited.json.sig"
-  run 4 "edited higher revision" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-install \
-    --registry "$dir/rev5-edited.json" --root-pub "$ROOT_PUB" --into "$into"
-  assert_equals registry-signature "$(json failed_check)" "bumping the revision without the root signature is refused"
-  assert_equals "$installed_sha" "$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$into/vp-owner-trust.json")" "the unsigned candidate changed nothing"
-
-  run 2 "install under /etc" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-install \
-    --registry "$dir/rev4.json" --root-pub "$ROOT_PUB" --into /etc/ai-harness/trust
-  assert_contains "$OUT" "never writes there" "an install into /etc is refused"
-  run 2 "registry-install without a named root" python3 "$TOOL" registry-install \
-    --registry "$dir/rev4.json" --into "$into"
-  assert_contains "$OUT" "--root-pub" "registry-install cannot run without an explicit root public key"
-  # Where --registry is optional, naming it without a root is refused rather than
-  # silently trusted: there is no default root path and /etc is never read.
-  run 2 "a registry with no root at all" python3 "$TOOL" route-resolve --routes "$dir/rev4.json" \
-    --owner-machine-key mk-2 --owner-epoch 4 --local-machine-key mk-1 --registry "$dir/rev4.json"
-  assert_contains "$OUT" "no default root path" "the root public key is always explicit"
-  pass "installation is atomic and refuses a rolled-back, unsigned or privileged target while leaving the installed registry byte-identical"
+  run 2 "a state directory owned by another identity is still refused" python3 "$TOOL" \
+    self-provision --state-dir /var/lib/ai-harness/vp-owner --machine-key mk-1
+  assert_contains "$OUT" "never writes there" "the write-safety guard survives the simplification"
+  pass "self-provision tightens a loosened state directory and drops retired fields instead of refusing, while the write-safety guard still refuses an installer-owned root"
 }
 
 # --- owner records -------------------------------------------------------------------------------
 
-test_a_validly_signed_owner_record_verifies_against_the_installed_registry() {
+test_a_validly_signed_owner_record_verifies_from_its_own_public_key() {
   local dir recomputed
   dir=$(new_dir verify)
-  good_registry "$dir/vp-owner-trust.json" 3
-  run 0 "sign" sign_record "$dir/owner.json" 3 4 2026-09-26T10:00:00Z
+  run 0 "sign" sign_record "$dir/owner.json" 4 2026-09-26T10:00:00Z
   assert_equals "$KEY1" "$(json key_id)" "the record is signed by this machine's key"
-  run 0 "positive control: verify" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/owner.json" --registry "$dir/vp-owner-trust.json" --root-pub "$ROOT_PUB"
+  run 0 "positive control: verify" python3 "$TOOL" verify-owner --record "$dir/owner.json"
   assert_equals True "$(json verified)" "a validly signed record verifies"
+  assert_equals '[]' "$(json warnings)" "a record with nothing to warn about carries no warnings"
   assert_equals active "$(json ownership_state)" "the ownership state is projected"
   assert_equals 4 "$(json owner_epoch)" "the owner epoch is projected"
   assert_equals mk-1 "$(json owner_machine_key)" "the owner machine key is projected"
+  assert_equals "$PUB1" "$(file_json "$dir/owner.json" protected.public_key)" "the record carries its own public key"
   assert_contains "$OUT" "is not a current record" "verification does not claim to be a CAS read"
-  # Positive control on the envelope: recompute the signed bytes and verify with openssl.
+  # Positive control on the envelope: recompute the signed bytes from the record's own
+  # protected public key and verify with openssl.
   recomputed=$(python3 - "$dir/owner.json" "$dir" <<'PY'
 import base64, json, subprocess, sys
 raw = open(sys.argv[1], "rb").read()
@@ -398,7 +379,7 @@ if raw != canonical:
     print("not-canonical"); sys.exit(0)
 msg = b"ai-harness/vp-owner/v1\0" + json.dumps({"protected": doc["protected"], "payload": doc["payload"]},
                                                sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-pub = json.load(open(work + "/vp-owner-trust.json"))["signers"][0]["public_key"]
+pub = doc["protected"]["public_key"]
 raw_pub = base64.urlsafe_b64decode(pub + "=" * (-len(pub) % 4))
 open(work + "/v.der", "wb").write(bytes.fromhex("302a300506032b6570032100") + raw_pub)
 open(work + "/v.msg", "wb").write(msg)
@@ -411,218 +392,121 @@ print("canonical-and-verified" if rc == 0 else "signature-failed")
 PY
 )
   assert_equals canonical-and-verified "$recomputed" "the stored blob is canonical and its signature covers the domain prefix plus the protected and payload objects"
-  pass "a record signed by a bound, active, in-window signer verifies, and its envelope matches the specified signed bytes exactly"
+  pass "a record verifies against the public key it carries, and its envelope matches the specified signed bytes exactly"
 }
 
 test_a_flipped_signature_or_payload_byte_fails_verification() {
   local dir
   dir=$(new_dir tamper)
-  good_registry "$dir/vp-owner-trust.json" 3
-  run 0 "sign" sign_record "$dir/owner.json" 3 4 2026-09-26T10:00:00Z
+  run 0 "sign" sign_record "$dir/owner.json" 4 2026-09-26T10:00:00Z
   mutate "$dir/owner.json" "$dir/flipped-sig.json" \
     'sig = doc["signature"]; doc["signature"] = ("B" if sig[0] != "B" else "C") + sig[1:]'
-  run 4 "one flipped signature byte" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/flipped-sig.json" --registry "$dir/vp-owner-trust.json" --root-pub "$ROOT_PUB"
+  run 4 "one flipped signature byte" python3 "$TOOL" verify-owner --record "$dir/flipped-sig.json"
   assert_equals signature "$(json failed_check)" "a flipped signature byte fails the signature check"
   mutate "$dir/owner.json" "$dir/flipped-payload.json" 'doc["payload"]["owner_epoch"] = 5'
-  run 4 "one flipped payload byte" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/flipped-payload.json" --registry "$dir/vp-owner-trust.json" --root-pub "$ROOT_PUB"
+  run 4 "one flipped payload byte" python3 "$TOOL" verify-owner --record "$dir/flipped-payload.json"
   assert_equals signature "$(json failed_check)" "an edited payload fails the signature check"
   mutate "$dir/owner.json" "$dir/other-alg.json" 'doc["protected"]["alg"] = "RSA"'
-  run 4 "another algorithm" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/other-alg.json" --registry "$dir/vp-owner-trust.json" --root-pub "$ROOT_PUB"
+  run 4 "another algorithm" python3 "$TOOL" verify-owner --record "$dir/other-alg.json"
   assert_equals alg "$(json failed_check)" "another algorithm is rejected before any signature work"
   mutate "$dir/owner.json" "$dir/missing.json" 'del doc["payload"]["chief_instance_key"]'
-  run 4 "missing field" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/missing.json" --registry "$dir/vp-owner-trust.json" --root-pub "$ROOT_PUB"
+  run 4 "missing field" python3 "$TOOL" verify-owner --record "$dir/missing.json"
   assert_equals structure "$(json failed_check)" "a missing payload field is rejected"
   assert_contains "$OUT" "chief_instance_key" "the missing field is named"
   mutate "$dir/owner.json" "$dir/padded.json" 'doc["signature"] = doc["signature"] + "=="'
-  run 4 "padded base64" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/padded.json" --registry "$dir/vp-owner-trust.json" --root-pub "$ROOT_PUB"
+  run 4 "padded base64" python3 "$TOOL" verify-owner --record "$dir/padded.json"
   assert_equals base64 "$(json failed_check)" "a padded signature is not canonical unpadded base64url"
   mutate "$dir/owner.json" "$dir/bad-ts.json" 'doc["payload"]["signed_at"] = "2026-09-26 10:00:00"'
-  run 4 "non-canonical timestamp" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/bad-ts.json" --registry "$dir/vp-owner-trust.json" --root-pub "$ROOT_PUB"
+  run 4 "non-canonical timestamp" python3 "$TOOL" verify-owner --record "$dir/bad-ts.json"
   assert_equals timestamp "$(json failed_check)" "a non-RFC-3339 signed_at is rejected"
-  pass "a flipped signature or payload byte, another algorithm, a missing field, padded base64, and a non-canonical timestamp each fail a named check"
+  mutate "$dir/owner.json" "$dir/legacy.json" 'doc["protected"]["trust_registry_revision"] = 4'
+  run 4 "a record from the retired registry schema" python3 "$TOOL" verify-owner --record "$dir/legacy.json"
+  assert_equals structure "$(json failed_check)" "a protected header carrying the retired registry field is not an owner record"
+  pass "a flipped signature or payload byte, another algorithm, a missing or retired field, padded base64, and a non-canonical timestamp each fail a named check"
 }
 
 test_a_non_canonical_serialization_is_refused_even_with_a_valid_signature() {
   local dir
   dir=$(new_dir canonical)
-  good_registry "$dir/vp-owner-trust.json" 3
-  run 0 "sign" sign_record "$dir/owner.json" 3 4 2026-09-26T10:00:00Z
+  run 0 "sign" sign_record "$dir/owner.json" 4 2026-09-26T10:00:00Z
   mutate "$dir/owner.json" "$dir/reordered.json" \
     'raw = (__import__("json").dumps({k: doc[k] for k in ("signature", "schema_version", "protected", "payload")}, sort_keys=False, separators=(",", ":")) + "\n").encode()'
-  run 4 "reordered keys" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/reordered.json" --registry "$dir/vp-owner-trust.json" --root-pub "$ROOT_PUB"
+  run 4 "reordered keys" python3 "$TOOL" verify-owner --record "$dir/reordered.json"
   assert_equals canonical-serialization "$(json failed_check)" "a reordered blob is not the canonical serialization"
   mutate "$dir/owner.json" "$dir/spaced.json" \
     'raw = (__import__("json").dumps(doc, sort_keys=True, separators=(", ", ": ")) + "\n").encode()'
-  run 4 "inserted whitespace" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/spaced.json" --registry "$dir/vp-owner-trust.json" --root-pub "$ROOT_PUB"
+  run 4 "inserted whitespace" python3 "$TOOL" verify-owner --record "$dir/spaced.json"
   assert_equals canonical-serialization "$(json failed_check)" "inserted whitespace is not canonical"
   python3 -c 'import sys; raw = open(sys.argv[1], "rb").read(); open(sys.argv[2], "wb").write(raw.rstrip(b"\n"))' \
     "$dir/owner.json" "$dir/no-lf.json"
-  run 4 "missing trailing LF" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/no-lf.json" --registry "$dir/vp-owner-trust.json" --root-pub "$ROOT_PUB"
+  run 4 "missing trailing LF" python3 "$TOOL" verify-owner --record "$dir/no-lf.json"
   assert_equals canonical-serialization "$(json failed_check)" "the one trailing LF is part of the stored blob"
-  run 0 "positive control: the untouched blob still verifies" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/owner.json" --registry "$dir/vp-owner-trust.json" --root-pub "$ROOT_PUB"
+  run 0 "positive control: the untouched blob still verifies" python3 "$TOOL" verify-owner --record "$dir/owner.json"
   pass "a blob that is not byte-for-byte the canonical serialization is refused before its signature is even consulted"
 }
 
-test_the_registry_binding_lifecycle_decides_every_record() {
+test_a_record_cannot_name_one_key_id_while_carrying_another_key() {
   local dir
-  dir=$(new_dir lifecycle)
-  good_registry "$dir/vp-owner-trust.json" 3
-  run 0 "sign" sign_record "$dir/owner.json" 3 4 2026-09-26T10:00:00Z
-  run 0 "positive control: verify under the active binding" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/owner.json" --registry "$dir/vp-owner-trust.json" --root-pub "$ROOT_PUB"
-
-  # Revoked after signing: the record still fails closed, regardless of signed time.
-  registry "$dir/revoked.json" 4 2026-09-01T00:00:00Z 2027-09-01T00:00:00Z \
-    "$(signer "$KEY1" "$PUB1" mk-1 firstmate-chief/mk-1 revoked 2026-09-01T00:00:00Z - 2026-09-26T10:30:00Z)"
-  run 0 "sign the revoking revision" python3 "$TOOL" registry-sign --registry "$dir/revoked.json" --root-key "$ROOT_KEY"
-  run 4 "revoked signer" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/owner.json" --registry "$dir/revoked.json" --root-pub "$ROOT_PUB"
-  assert_equals revoked-binding "$(json failed_check)" "a revoked binding rejects a record it signed before revocation"
-
-  # A binding for another machine: the signature is good but the identity is not.
-  registry "$dir/wrong-machine.json" 4 2026-09-01T00:00:00Z 2027-09-01T00:00:00Z \
-    "$(signer "$KEY1" "$PUB1" mk-9 firstmate-chief/mk-9 active 2026-09-01T00:00:00Z - -)"
-  run 0 "sign the wrong-machine revision" python3 "$TOOL" registry-sign --registry "$dir/wrong-machine.json" --root-key "$ROOT_KEY"
-  run 4 "wrong-machine binding" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/owner.json" --registry "$dir/wrong-machine.json" --root-pub "$ROOT_PUB"
-  assert_equals machine-binding "$(json failed_check)" "the binding's machine_key must match the record"
-  assert_contains "$OUT" "mk-9" "the disagreeing machine key is named"
-
-  # A binding for the right machine but another chief instance.
-  registry "$dir/wrong-chief.json" 4 2026-09-01T00:00:00Z 2027-09-01T00:00:00Z \
-    "$(signer "$KEY1" "$PUB1" mk-1 firstmate-chief/other active 2026-09-01T00:00:00Z - -)"
-  run 0 "sign the wrong-chief revision" python3 "$TOOL" registry-sign --registry "$dir/wrong-chief.json" --root-key "$ROOT_KEY"
-  run 4 "wrong chief instance" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/owner.json" --registry "$dir/wrong-chief.json" --root-pub "$ROOT_PUB"
-  assert_equals chief-binding "$(json failed_check)" "the binding's chief_instance_key must match the record"
-
-  # Signed outside the binding's signing-time window, both directions.
-  registry "$dir/retired.json" 4 2026-09-01T00:00:00Z 2027-09-01T00:00:00Z \
-    "$(signer "$KEY1" "$PUB1" mk-1 firstmate-chief/mk-1 retired 2026-09-01T00:00:00Z 2026-09-26T09:00:00Z -)"
-  run 0 "sign the retiring revision" python3 "$TOOL" registry-sign --registry "$dir/retired.json" --root-key "$ROOT_KEY"
-  run 4 "signed after not_after" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/owner.json" --registry "$dir/retired.json" --root-pub "$ROOT_PUB"
-  assert_equals signing-window "$(json failed_check)" "a record signed after not_after is rejected"
-  registry "$dir/future.json" 4 2026-09-01T00:00:00Z 2027-09-01T00:00:00Z \
-    "$(signer "$KEY1" "$PUB1" mk-1 firstmate-chief/mk-1 active 2026-09-27T00:00:00Z - -)"
-  run 0 "sign the not-yet-valid revision" python3 "$TOOL" registry-sign --registry "$dir/future.json" --root-key "$ROOT_KEY"
-  run 4 "signed before not_before" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/owner.json" --registry "$dir/future.json" --root-pub "$ROOT_PUB"
-  assert_equals signing-window "$(json failed_check)" "a record signed before not_before is rejected"
-
-  # A registry that does not know this key at all.
-  registry "$dir/other-signer.json" 4 2026-09-01T00:00:00Z 2027-09-01T00:00:00Z \
-    "$(signer "$KEY2" "$PUB2" mk-2 firstmate-chief/mk-2 active 2026-09-01T00:00:00Z - -)"
-  run 0 "sign the other-signer revision" python3 "$TOOL" registry-sign --registry "$dir/other-signer.json" --root-key "$ROOT_KEY"
-  run 4 "unknown key id" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/owner.json" --registry "$dir/other-signer.json" --root-pub "$ROOT_PUB"
-  assert_equals unknown-key-id "$(json failed_check)" "an unbound key id is rejected"
-
-  # An installed registry that fails its own verification rejects every record.
-  # A structurally valid but locally edited installed registry: the record itself is
-  # untouched and correctly signed, and it is still rejected.
-  mutate "$dir/vp-owner-trust.json" "$dir/tampered.json" 'doc["signers"][0]["machine_key"] = "mk-9"'
-  cp "$dir/vp-owner-trust.json.sig" "$dir/tampered.json.sig"
-  run 4 "installed registry that does not verify" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/owner.json" --registry "$dir/tampered.json" --root-pub "$ROOT_PUB"
-  assert_equals registry-signature "$(json failed_check)" "a record is never verified against an unverifiable registry"
-  # A registry whose own structure contradicts itself is refused before any crypto.
-  mutate "$dir/vp-owner-trust.json" "$dir/malformed.json" 'doc["signers"][0]["status"] = "revoked"'
-  cp "$dir/vp-owner-trust.json.sig" "$dir/malformed.json.sig"
-  run 4 "installed registry that contradicts itself" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/owner.json" --registry "$dir/malformed.json" --root-pub "$ROOT_PUB"
-  assert_equals registry-structure "$(json failed_check)" "a revoked binding with no revoked_at is malformed"
-  pass "revocation, a wrong machine or chief binding, either edge of the signing window, an unknown key, and an unverifiable registry each reject with their own named check"
+  dir=$(new_dir self-verifying)
+  run 0 "sign" sign_record "$dir/owner.json" 4 2026-09-26T10:00:00Z
+  run 0 "positive control: verify" python3 "$TOOL" verify-owner --record "$dir/owner.json"
+  # Swap in another key's public key: the key id no longer hashes to the material
+  # the record carries, so the record is not an owner record at all. Without this
+  # check a forged record could carry any key and claim the real machine's key id.
+  mutate "$dir/owner.json" "$dir/swapped.json" "doc['protected']['public_key'] = '$PUB2'"
+  run 4 "public key swapped for another key's" python3 "$TOOL" verify-owner --record "$dir/swapped.json"
+  assert_equals key-id-mismatch "$(json failed_check)" "the key id must be the SHA-256 of the public key beside it"
+  assert_contains "$OUT" "$KEY1" "the refusal names the key id that does not match"
+  # The other direction: keep the key, rename the id.
+  mutate "$dir/owner.json" "$dir/renamed.json" "doc['protected']['key_id'] = '$KEY2'"
+  run 4 "key id swapped for another key's" python3 "$TOOL" verify-owner --record "$dir/renamed.json"
+  assert_equals key-id-mismatch "$(json failed_check)" "renaming the key id fails the same check"
+  pass "a record whose key id is not the hash of the public key it carries is rejected as a document, in both directions"
 }
 
-test_a_future_provenance_revision_is_refused_until_the_installed_registry_catches_up() {
+test_a_chief_instance_key_must_derive_from_its_own_owner_machine_key() {
   local dir
-  dir=$(new_dir revision)
-  good_registry "$dir/rev3.json" 3
-  run 0 "sign with provenance revision 4" sign_record "$dir/owner4.json" 4 5 2026-09-26T10:00:00Z
-  run 4 "stale reader" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/owner4.json" --registry "$dir/rev3.json" --root-pub "$ROOT_PUB"
-  assert_equals future-registry-revision "$(json failed_check)" "a record from a future revision refuses dispatch"
-  assert_equals 4 "$(json record_trust_registry_revision)" "the record revision is reported"
-  assert_equals 3 "$(json installed_registry_revision)" "the installed revision is reported"
-  good_registry "$dir/rev4.json" 4
-  run 0 "after the registry catches up" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/owner4.json" --registry "$dir/rev4.json" --root-pub "$ROOT_PUB"
-  assert_equals True "$(json verified)" "verification resumes once the installed revision reaches the record's"
-  pass "a stale reader refuses a future-revision record by name and verifies it only after the installed registry reaches that revision"
-}
-
-test_an_unrelated_enrollment_revision_still_verifies_an_existing_record_without_re_signing() {
-  local dir before
-  dir=$(new_dir unrelated)
-  good_registry "$dir/rev3.json" 3
-  run 0 "sign at revision 3" sign_record "$dir/owner.json" 3 4 2026-09-26T10:00:00Z
-  before=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$dir/owner.json")
-  # Revision 4 enrolls an unrelated machine and renews the expiry; mk-1 stays bound.
-  registry "$dir/rev4.json" 4 2026-09-20T00:00:00Z 2028-09-01T00:00:00Z \
-    "$(signer "$KEY1" "$PUB1" mk-1 firstmate-chief/mk-1 active 2026-09-01T00:00:00Z - -)" \
-    "$(signer "$KEY2" "$PUB2" mk-2 firstmate-chief/mk-2 active 2026-09-20T00:00:00Z - -)"
-  run 0 "sign revision 4" python3 "$TOOL" registry-sign --registry "$dir/rev4.json" --root-key "$ROOT_KEY"
-  run 0 "the revision-3 record still verifies" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/owner.json" --registry "$dir/rev4.json" --root-pub "$ROOT_PUB"
-  assert_equals True "$(json verified)" "an unrelated enrollment or expiry renewal does not invalidate the record"
-  assert_equals 3 "$(json record_trust_registry_revision)" "the record keeps its own provenance revision"
-  assert_equals 4 "$(json installed_registry_revision)" "the installed revision moved on"
-  assert_equals "$before" "$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$dir/owner.json")" "the record was not re-signed"
-  pass "an ordinary newer registry revision preserves an existing record whose signer remains bound and in window, with no re-signing"
-}
-
-test_sign_owner_refuses_a_key_the_installed_registry_does_not_authorize() {
-  local dir
-  dir=$(new_dir signing)
-  good_registry "$dir/rev3.json" 3
-  run 0 "positive control: an active signer may sign" python3 "$TOOL" --now 2026-09-26T10:00:00Z sign-owner \
+  dir=$(new_dir chief-binding)
+  run 0 "positive control: a derived chief key signs" sign_record "$dir/owner.json" 4 2026-09-26T10:00:00Z
+  run 0 "and verifies" python3 "$TOOL" verify-owner --record "$dir/owner.json"
+  assert_equals firstmate-chief/mk-1 "$(json chief_instance_key)" "the chief instance key is projected"
+  mutate "$dir/owner.json" "$dir/other-chief.json" \
+    'doc["payload"]["chief_instance_key"] = "firstmate-chief/mk-9"'
+  run 4 "a chief key from another machine" python3 "$TOOL" verify-owner --record "$dir/other-chief.json"
+  assert_equals chief-binding "$(json failed_check)" "a chief key that does not derive from the owner machine key is rejected"
+  assert_contains "$OUT" firstmate-chief/mk-1 "the refusal names the only chief key that record could carry"
+  run 2 "signing refuses the same contradiction" python3 "$TOOL" --now 2026-09-26T10:00:00Z sign-owner \
     --private-key "$PRIV1" --vp-id vp/ai-harness/primary --owner-machine-key mk-1 --owner-epoch 4 \
-    --chief-instance-key firstmate-chief/mk-1 --ownership-state active \
-    --registry "$dir/rev3.json" --root-pub "$ROOT_PUB" --out "$dir/owner.json"
-  assert_equals 3 "$(json trust_registry_revision)" "the provenance revision is the verified installed one"
-  assert_contains "$OUT" "signing does not publish" "signing does not claim to have published the record"
-  run 2 "an unenrolled key may not sign" python3 "$TOOL" --now 2026-09-26T10:00:00Z sign-owner \
-    --private-key "$PRIV2" --vp-id vp/ai-harness/primary --owner-machine-key mk-2 --owner-epoch 1 \
-    --chief-instance-key firstmate-chief/mk-2 --ownership-state active \
-    --registry "$dir/rev3.json" --root-pub "$ROOT_PUB" --out "$dir/nope.json"
-  assert_contains "$OUT" "non-dispatching until a human" "an unenrolled machine stays non-dispatching"
+    --chief-instance-key firstmate-chief/mk-9 --ownership-state active --out "$dir/nope.json"
+  assert_contains "$OUT" firstmate-chief/mk-1 "signing names the derived chief key it expected"
   assert_absent "$dir/nope.json" "a refused signing wrote no record"
-  registry "$dir/revoked.json" 4 2026-09-01T00:00:00Z 2027-09-01T00:00:00Z \
-    "$(signer "$KEY1" "$PUB1" mk-1 firstmate-chief/mk-1 revoked 2026-09-01T00:00:00Z - 2026-09-25T00:00:00Z)"
-  run 0 "sign the revoking revision" python3 "$TOOL" registry-sign --registry "$dir/revoked.json" --root-key "$ROOT_KEY"
-  run 2 "a revoked signer may not sign" python3 "$TOOL" --now 2026-09-26T10:00:00Z sign-owner \
-    --private-key "$PRIV1" --vp-id vp/ai-harness/primary --owner-machine-key mk-1 --owner-epoch 5 \
-    --chief-instance-key firstmate-chief/mk-1 --ownership-state active \
-    --registry "$dir/revoked.json" --root-pub "$ROOT_PUB" --out "$dir/revoked-record.json"
-  assert_contains "$OUT" "revoked" "the revoked status is named"
-  assert_absent "$dir/revoked-record.json" "a revoked signer wrote no record"
-  run 2 "no provenance revision at all" python3 "$TOOL" --now 2026-09-26T10:00:00Z sign-owner \
-    --private-key "$PRIV1" --vp-id vp/ai-harness/primary --owner-machine-key mk-1 --owner-epoch 4 \
-    --chief-instance-key firstmate-chief/mk-1 --ownership-state active --out "$dir/no-rev.json"
-  assert_contains "$OUT" "trust_registry_revision" "the provenance revision is never invented"
-  run 2 "a prepared handoff must name its handoff" python3 "$TOOL" --now 2026-09-26T10:00:00Z sign-owner \
-    --private-key "$PRIV1" --vp-id vp/ai-harness/primary --owner-machine-key mk-1 --owner-epoch 4 \
-    --chief-instance-key firstmate-chief/mk-1 --ownership-state handoff-prepared \
-    --trust-registry-revision 3 --out "$dir/bad-handoff.json"
-  assert_contains "$OUT" "must name its handoff" "a prepared record without a handoff object is refused"
-  pass "only a bound, active or retiring signer may sign, and a refused signing writes nothing"
+  pass "chief_instance_key is derived, not asserted: a record whose chief key does not follow from its owner machine key is refused at signing and rejected at verification"
+}
+
+test_an_unexpected_owner_machine_key_warns_and_still_verifies() {
+  local dir
+  dir=$(new_dir expected-owner)
+  run 0 "sign" sign_record "$dir/owner.json" 4 2026-09-26T10:00:00Z
+  run_split 0 "positive control: the expected owner produces no warning" python3 "$TOOL" verify-owner \
+    --record "$dir/owner.json" --expected-owner-machine-key mk-1
+  assert_equals True "$(json verified)" "the matching expectation verifies"
+  assert_equals '[]' "$(json warnings)" "a matching expectation warns about nothing"
+  assert_equals "" "$ERR" "and says nothing on stderr"
+  # The whole point of the simplification: an identity expectation that disagrees is a
+  # soft warning that still dispatches, never a refusal that blocks.
+  run_split 0 "a disagreeing expectation still verifies" python3 "$TOOL" verify-owner \
+    --record "$dir/owner.json" --expected-owner-machine-key mk-9
+  assert_equals True "$(json verified)" "a disagreeing expectation does not stop verification"
+  assert_contains "$(json warnings)" machine-binding "the warning is named in the JSON object"
+  assert_contains "$(json warnings)" mk-9 "the warning names the expectation that was not met"
+  assert_contains "$ERR" "warning: machine-binding" "the same warning is written to stderr"
+  assert_contains "$ERR" mk-1 "the stderr warning names the record's own owner machine key"
+  pass "an owner machine key that is not the expected one is a soft warning in the JSON and on stderr, and still exits 0"
 }
 
 test_a_prepared_handoff_record_round_trips_with_its_destination_and_nonce() {
   local dir
   dir=$(new_dir handoff)
-  good_registry "$dir/rev3.json" 3
   cat > "$dir/handoff.json" <<'JSON'
 {"handoff_id": "ho-1", "destination_machine_key": "mk-2", "next_owner_epoch": 5,
  "nonce": "nonce-abc", "prepared_at": "2026-09-26T10:00:00Z"}
@@ -631,23 +515,27 @@ JSON
     --private-key "$PRIV1" --vp-id vp/ai-harness/primary --owner-machine-key mk-1 --owner-epoch 4 \
     --chief-instance-key firstmate-chief/mk-1 --ownership-state handoff-prepared \
     --predecessor-object-id 1111111111111111111111111111111111111111 \
-    --handoff-file "$dir/handoff.json" --trust-registry-revision 3 --out "$dir/prepared.json"
-  run 0 "verify the prepared handoff" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/prepared.json" --registry "$dir/rev3.json" --root-pub "$ROOT_PUB"
+    --handoff-file "$dir/handoff.json" --out "$dir/prepared.json"
+  run 0 "verify the prepared handoff" python3 "$TOOL" verify-owner --record "$dir/prepared.json"
   assert_equals handoff-prepared "$(json ownership_state)" "the prepared state is projected"
   assert_equals mk-2 "$(json handoff.destination_machine_key)" "the destination machine is projected"
   assert_equals 5 "$(json handoff.next_owner_epoch)" "the next epoch is projected"
   assert_equals nonce-abc "$(json handoff.nonce)" "the single-use nonce is projected"
   mutate "$dir/prepared.json" "$dir/retargeted.json" 'doc["payload"]["handoff"]["destination_machine_key"] = "mk-9"'
-  run 4 "a retargeted handoff" python3 "$TOOL" --now 2026-09-26T11:00:00Z verify-owner \
-    --record "$dir/retargeted.json" --registry "$dir/rev3.json" --root-pub "$ROOT_PUB"
+  run 4 "a retargeted handoff" python3 "$TOOL" verify-owner --record "$dir/retargeted.json"
   assert_equals signature "$(json failed_check)" "changing the destination invalidates the signature"
   run 2 "a next epoch that does not advance" python3 "$TOOL" --now 2026-09-26T10:00:00Z sign-owner \
     --private-key "$PRIV1" --vp-id vp/ai-harness/primary --owner-machine-key mk-1 --owner-epoch 9 \
     --chief-instance-key firstmate-chief/mk-1 --ownership-state handoff-prepared \
-    --handoff-file "$dir/handoff.json" --trust-registry-revision 3 --out "$dir/stale-epoch.json"
+    --handoff-file "$dir/handoff.json" --out "$dir/stale-epoch.json"
   assert_contains "$OUT" "must be greater than the current" "a prepared handoff must advance the epoch"
-  pass "a prepared handoff carries its destination, next epoch and nonce inside the signed payload, so none of them can be changed"
+  run 2 "a prepared state with no handoff at all" python3 "$TOOL" --now 2026-09-26T10:00:00Z sign-owner \
+    --private-key "$PRIV1" --vp-id vp/ai-harness/primary --owner-machine-key mk-1 --owner-epoch 4 \
+    --chief-instance-key firstmate-chief/mk-1 --ownership-state handoff-prepared \
+    --out "$dir/bad-handoff.json"
+  assert_contains "$OUT" "must name its handoff" "a prepared record without a handoff object is refused"
+  assert_absent "$dir/bad-handoff.json" "a refused signing wrote no record"
+  pass "a prepared handoff carries its destination, next epoch and nonce inside the signed payload, and signing refuses a prepared state with no handoff or a next epoch that does not advance"
 }
 
 # --- owner-route resolution ----------------------------------------------------------------------
@@ -724,108 +612,92 @@ test_route_resolve_blocks_forwarding_on_a_missing_duplicate_or_incomplete_row() 
     --owner-machine-key mk-2 --owner-epoch 4 --local-machine-key mk-1
   assert_equals route_revision "$(json invalid_field)" "a missing route revision is named"
 
-  run 2 "a routes file of the wrong shape" python3 "$TOOL" route-resolve --routes "$ROOT_PUB" \
+  printf 'not a routes document\n' > "$dir/garbage.txt"
+  run 2 "a routes file of the wrong shape" python3 "$TOOL" route-resolve --routes "$dir/garbage.txt" \
     --owner-machine-key mk-2 --owner-epoch 4 --local-machine-key mk-1
   assert_contains "$OUT" "refused" "a non-routes file is refused"
   pass "a missing, duplicate, or incomplete route row blocks forwarding, names the invalid field, and never yields a direct VP target"
 }
 
-test_route_resolve_refuses_a_chief_instance_key_the_registry_contradicts() {
-  local dir
-  dir=$(new_dir route-registry)
-  routes_file "$dir/chief-routes.json" "{\"schema_version\":1,\"routes\":[$ROUTE_ROW_MK2]}"
-  registry "$dir/agree.json" 5 2026-09-01T00:00:00Z 2027-09-01T00:00:00Z \
-    "$(signer "$KEY2" "$PUB2" mk-2 firstmate-chief/mk-2 active 2026-09-01T00:00:00Z - -)"
-  run 0 "sign the agreeing registry" python3 "$TOOL" registry-sign --registry "$dir/agree.json" --root-key "$ROOT_KEY"
-  run 0 "positive control: route and registry agree" python3 "$TOOL" --now 2026-09-26T10:00:00Z route-resolve \
-    --routes "$dir/chief-routes.json" --owner-machine-key mk-2 --owner-epoch 4 --local-machine-key mk-1 \
-    --registry "$dir/agree.json" --root-pub "$ROOT_PUB"
-  assert_equals resolved "$(json owner_route_status)" "an agreeing registry resolves the route"
-  assert_equals 5 "$(json installed_registry_revision)" "the registry revision is reported"
-
-  registry "$dir/disagree.json" 5 2026-09-01T00:00:00Z 2027-09-01T00:00:00Z \
-    "$(signer "$KEY2" "$PUB2" mk-2 firstmate-chief/other-chief active 2026-09-01T00:00:00Z - -)"
-  run 0 "sign the disagreeing registry" python3 "$TOOL" registry-sign --registry "$dir/disagree.json" --root-key "$ROOT_KEY"
-  run 2 "the registry contradicts the route" python3 "$TOOL" --now 2026-09-26T10:00:00Z route-resolve \
-    --routes "$dir/chief-routes.json" --owner-machine-key mk-2 --owner-epoch 4 --local-machine-key mk-1 \
-    --registry "$dir/disagree.json" --root-pub "$ROOT_PUB"
-  assert_equals chief_instance_key "$(json invalid_field)" "the contradicting field is named"
-  assert_equals forwarding-blocked "$(json dispatch_authority)" "a contradiction blocks forwarding"
-  assert_contains "$OUT" other-chief "the registry's binding is named"
-
-  registry "$dir/unbound.json" 5 2026-09-01T00:00:00Z 2027-09-01T00:00:00Z \
-    "$(signer "$KEY1" "$PUB1" mk-1 firstmate-chief/mk-1 active 2026-09-01T00:00:00Z - -)"
-  run 0 "sign the unbound registry" python3 "$TOOL" registry-sign --registry "$dir/unbound.json" --root-key "$ROOT_KEY"
-  run 2 "no binding for the owner machine" python3 "$TOOL" --now 2026-09-26T10:00:00Z route-resolve \
-    --routes "$dir/chief-routes.json" --owner-machine-key mk-2 --owner-epoch 4 --local-machine-key mk-1 \
-    --registry "$dir/unbound.json" --root-pub "$ROOT_PUB"
-  assert_equals chief_instance_key "$(json invalid_field)" "an owner machine with no binding blocks forwarding"
-  pass "a chief_instance_key the installed registry contradicts, or an owner machine it does not bind, blocks forwarding instead of guessing a target"
-}
-
-test_registry_sign_canonicalizes_a_human_readable_registry_before_signing() {
-  local dir
-  dir=$(new_dir canonicalize)
-  registry "$dir/canonical.json" 3 2026-09-01T00:00:00Z 2027-09-01T00:00:00Z \
-    "$(signer "$KEY1" "$PUB1" mk-1 firstmate-chief/mk-1 active 2026-09-01T00:00:00Z - -)"
-  python3 -c '
-import json, sys
-json.dump(json.load(open(sys.argv[1])), open(sys.argv[2], "w"), indent=2)
-open(sys.argv[2], "a").write("\n")' "$dir/canonical.json" "$dir/readable.json"
-  run 4 "a readable registry is not signed as it stands" python3 "$TOOL" registry-sign \
-    --registry "$dir/readable.json" --root-key "$ROOT_KEY"
-  assert_equals registry-canonical-serialization "$(json failed_check)" "signing refuses a non-canonical registry"
-  assert_absent "$dir/readable.json.sig" "the refused signing wrote no signature"
-  run 0 "canonicalize then sign" python3 "$TOOL" registry-sign --registry "$dir/readable.json" \
-    --root-key "$ROOT_KEY" --canonicalize
-  assert_equals 3 "$(json registry_revision)" "the canonicalized registry is signed"
-  run 0 "the canonicalized registry verifies" python3 "$TOOL" --now 2026-09-26T10:00:00Z registry-verify \
-    --registry "$dir/readable.json" --root-pub "$ROOT_PUB"
-  assert_equals True "$(json verified)" "what was rewritten is exactly what was signed"
-  pass "--canonicalize makes the reviewed registry and the signed bytes one object, and signing refuses a non-canonical registry otherwise"
-}
+# --- the shipped examples, and the vocabulary this tool no longer carries --------------------------
 
 test_the_shipped_documentation_examples_are_real() {
-  local dir
+  local dir checked machine
   dir=$(new_dir examples)
-  cp "$ROOT/docs/examples/vp-owner-trust.json" "$dir/vp-owner-trust.json"
-  run 0 "sign the shipped registry example with a test root" python3 "$TOOL" registry-sign \
-    --registry "$dir/vp-owner-trust.json" --root-key "$ROOT_KEY" --canonicalize
-  run 0 "the shipped registry example verifies" python3 "$TOOL" --now 2026-10-01T00:00:00Z registry-verify \
-    --registry "$dir/vp-owner-trust.json" --root-pub "$ROOT_PUB"
-  assert_equals True "$(json verified)" "every key id in the example is the hash of its own public key"
-  assert_equals 4 "$(json registry_revision)" "the example's revision is read"
+  # Nothing can sign with the example self.json here - its private key exists on no
+  # machine - so it is checked two ways. First recomputed here: it is canonical, it
+  # carries exactly the six fields the tool writes, its key id is the SHA-256 of the
+  # public key beside it, and its chief instance key derives from its machine key.
+  checked=$(python3 - "$ROOT/docs/examples/vp-owner-self.json" <<'PY'
+import base64, hashlib, json, sys
+raw = open(sys.argv[1], "rb").read()
+doc = json.loads(raw)
+pub = base64.urlsafe_b64decode(doc["public_key"] + "=" * (-len(doc["public_key"]) % 4))
+canonical = (json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+print("canonical" if raw == canonical else "not-canonical",
+      "fields-ok" if sorted(doc) == ["chief_instance_key", "key_id", "machine_key", "provisioned_at",
+                                     "public_key", "schema_version"] else "fields-wrong",
+      "key-id-ok" if doc["key_id"] == "ed25519-sha256:" + hashlib.sha256(pub).hexdigest() else "key-id-wrong",
+      "chief-ok" if doc["chief_instance_key"] == "firstmate-chief/" + doc["machine_key"] else "chief-wrong")
+PY
+)
+  assert_equals "canonical fields-ok key-id-ok chief-ok" "$checked" "the example self.json is canonical, complete, and self-consistent"
+  # Second, read by the tool: sign-owner --state-dir accepts the document and resolves
+  # its key id to the key path it names, which is the only part that is absent here.
+  mkdir -p "$dir/state/keys"
+  chmod 700 "$dir/state" "$dir/state/keys"
+  cp "$ROOT/docs/examples/vp-owner-self.json" "$dir/state/self.json"
+  machine=$(file_json "$dir/state/self.json" machine_key)
+  run 2 "the tool reads the example as a signing identity" python3 "$TOOL" sign-owner \
+    --state-dir "$dir/state" --vp-id vp/ai-harness/primary --owner-machine-key "$machine" \
+    --owner-epoch 1 --chief-instance-key "firstmate-chief/$machine" --ownership-state active
+  assert_contains "$OUT" "$(file_json "$dir/state/self.json" key_id).key" \
+    "the refusal names the key path the example's own key id resolves to, so the document itself was accepted"
+  # The routes example resolves a remote owner, and the two examples name the same fleet.
   run 0 "the shipped routes example resolves" python3 "$TOOL" route-resolve \
     --routes "$ROOT/docs/examples/chief-routes.json" \
     --owner-machine-key e2a94c17-8b06-4d3f-a571-0c9e4b18d6f2 --owner-epoch 4 \
-    --local-machine-key b7c1f0d2-3e45-4a89-9f10-6d2b8c4e7a51
+    --local-machine-key "$machine"
   assert_equals resolved "$(json owner_route_status)" "the shipped routes example resolves a remote owner"
   assert_equals cos-hetzner "$(json endpoints.0.native_agent_name)" "the example's native agent name is resolved"
-  run 0 "the shipped examples agree with each other" python3 "$TOOL" --now 2026-10-01T00:00:00Z route-resolve \
+  run 0 "and the example self machine is local in that same routes file" python3 "$TOOL" route-resolve \
     --routes "$ROOT/docs/examples/chief-routes.json" \
-    --owner-machine-key e2a94c17-8b06-4d3f-a571-0c9e4b18d6f2 --owner-epoch 4 \
-    --local-machine-key b7c1f0d2-3e45-4a89-9f10-6d2b8c4e7a51 \
-    --registry "$dir/vp-owner-trust.json" --root-pub "$ROOT_PUB"
-  assert_equals resolved "$(json owner_route_status)" "the example routes and registry bind the same chief instance keys"
-  pass "the shipped registry and routes examples are internally consistent and accepted by the tool, not illustrative pseudo-JSON"
+    --owner-machine-key "$machine" --owner-epoch 4 --local-machine-key "$machine"
+  assert_equals local "$(json owner_route_status)" "the two shipped examples describe the same machine"
+  pass "the shipped self and routes examples are accepted by the tool and describe the same fleet, not illustrative pseudo-JSON"
+}
+
+test_the_tool_carries_no_expiry_revocation_or_registry_vocabulary() {
+  local dir pattern hits
+  dir=$(new_dir vocabulary)
+  pattern='non-dispatching|expires_at|not_after|not_before|revoked|registry_revision|trust_registry_revision|root-pub'
+  hits=$(grep -cE "$pattern" "$TOOL" || true)
+  assert_equals 0 "$hits" "the tool carries no expiry, revocation, registry or root-key vocabulary"
+  # Canary: the same grep over a file that does carry that vocabulary must fire, so a
+  # typo in the pattern cannot make this test pass by matching nothing anywhere.
+  printf 'this line says not_after and revoked\n' > "$dir/canary.txt"
+  hits=$(grep -cE "$pattern" "$dir/canary.txt" || true)
+  assert_equals 1 "$hits" "the canary proves the pattern can still fire"
+  pass "the retired expiry, revocation, registry and root-key vocabulary is absent from the tool, under a pattern proved able to fire"
 }
 
 test_keygen_creates_a_private_key_whose_id_is_the_hash_of_its_own_public_key
 test_keygen_refuses_a_privileged_or_unowned_directory_without_writing
-test_enroll_request_is_canonical_and_its_proof_of_possession_verifies
-test_a_root_signed_registry_verifies_and_any_local_edit_does_not
-test_registry_install_is_atomic_and_a_rollback_leaves_the_installed_file_untouched
-test_a_validly_signed_owner_record_verifies_against_the_installed_registry
+test_self_provision_creates_a_signer_identity_unattended_and_never_prints_the_key
+test_a_second_self_provision_run_changes_nothing
+test_self_provision_heals_a_deleted_or_garbage_self_record_by_adopting_the_existing_key
+test_self_provision_heals_a_self_record_naming_a_key_that_is_not_there
+test_self_provision_heals_a_hand_edited_machine_key_and_public_key
+test_self_provision_tightens_a_shared_state_directory_and_drops_legacy_fields
+test_a_validly_signed_owner_record_verifies_from_its_own_public_key
 test_a_flipped_signature_or_payload_byte_fails_verification
 test_a_non_canonical_serialization_is_refused_even_with_a_valid_signature
-test_the_registry_binding_lifecycle_decides_every_record
-test_a_future_provenance_revision_is_refused_until_the_installed_registry_catches_up
-test_an_unrelated_enrollment_revision_still_verifies_an_existing_record_without_re_signing
-test_sign_owner_refuses_a_key_the_installed_registry_does_not_authorize
+test_a_record_cannot_name_one_key_id_while_carrying_another_key
+test_a_chief_instance_key_must_derive_from_its_own_owner_machine_key
+test_an_unexpected_owner_machine_key_warns_and_still_verifies
 test_a_prepared_handoff_record_round_trips_with_its_destination_and_nonce
 test_route_resolve_projects_local_ownership_without_a_routes_lookup
 test_route_resolve_returns_exactly_one_row_and_the_ordered_endpoints
 test_route_resolve_blocks_forwarding_on_a_missing_duplicate_or_incomplete_row
-test_route_resolve_refuses_a_chief_instance_key_the_registry_contradicts
-test_registry_sign_canonicalizes_a_human_readable_registry_before_signing
 test_the_shipped_documentation_examples_are_real
+test_the_tool_carries_no_expiry_revocation_or_registry_vocabulary
