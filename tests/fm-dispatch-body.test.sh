@@ -29,6 +29,23 @@ unset FM_HOME FM_DISPATCH_BODY_DB
 command -v python3 >/dev/null 2>&1 || { printf 'skip: python3 not found\n'; exit 0; }
 python3 -c 'import sqlite3' 2>/dev/null || { printf 'skip: python3 has no sqlite3 module\n'; exit 0; }
 
+# Every fixture timestamp is anchored to the run's own clock, never to a literal
+# date. Literal dates made the suite a time bomb: the fixture window closed at a
+# fixed instant, after which every claim that does not pass its own --now found
+# the object expired and returned a receipt (exit 4) instead of the body.
+# ts <offset-seconds> prints an RFC 3339 UTC instant relative to now (python
+# rather than `date -d`, which is GNU-only and this fork also runs on macOS).
+ts() {
+  python3 -c 'import sys, datetime as d; print((d.datetime.now(d.timezone.utc) + d.timedelta(seconds=int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$1"
+}
+STAGED_AT=$(ts -3600)          # the fixture was staged an hour ago
+BEFORE_STAGED_AT=$(ts -7200)   # earlier than that, for the inverted-expiry case
+WITHIN_WINDOW_AT=$(ts 0)       # inside the fixture's 24h window
+DEADLINE_AT=$(ts 82800)        # the fixture's expiry: staged + 24h
+PAST_DEADLINE_AT=$(ts 108000)  # after the deadline, for the expiry sweep
+BEFORE_RETENTION_AT=$(ts 345600)  # staged + 4 days: inside the 7-day retention
+AFTER_RETENTION_AT=$(ts 1123200)  # staged + 13 days: past it
+
 # run <expected-exit> <label> <cmd...>: capture combined output into OUT, exit into RC.
 OUT=
 RC=0
@@ -94,7 +111,7 @@ stage() {  # <db> <id> [extra args...]  (fixed identity fields)
   shift 2
   python3 "$BROKER" --db "$db" stage --dispatch-id "$id" --vp-id vp/ai-harness/primary \
     --owner-machine-key mk-1 --owner-epoch 4 --chief-generation 7 --staged-by-machine-key mk-1 \
-    --created-at 2026-09-26T10:00:00Z --expires-at 2026-09-27T10:00:00Z "$@"
+    --created-at "$STAGED_AT" --expires-at "$DEADLINE_AT" "$@"
 }
 
 # --- stage: one canonical body, committed before any transport --------------------------------
@@ -109,13 +126,13 @@ test_stage_commits_a_private_database_and_a_verifiable_hash() {
   assert_not_contains "$OUT" "invoke your /next" "stage never echoes the body"
   assert_equals 600 "$(stat -c %a "$db" 2>/dev/null || stat -f %Lp "$db")" "database is created 0600"
   # Positive control on the hash contract: recompute RFC 8785 + domain prefix independently.
-  expected_hash=$(python3 - "$BODY_FILE" <<'PY'
+  expected_hash=$(python3 - "$BODY_FILE" "$STAGED_AT" "$DEADLINE_AT" <<'PY'
 import hashlib, json, sys
 body = open(sys.argv[1], "rb").read().decode("utf-8")
 payload = {"schema_version": 1, "dispatch_id": "cos-1", "vp_id": "vp/ai-harness/primary",
            "owner_machine_key": "mk-1", "owner_epoch": 4, "chief_generation": 7,
            "staged_by_machine_key": "mk-1", "body_utf8": body,
-           "created_at": "2026-09-26T10:00:00Z", "expires_at": "2026-09-27T10:00:00Z"}
+           "created_at": sys.argv[2], "expires_at": sys.argv[3]}
 canon = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 print(hashlib.sha256(b"firstmate-dispatch-body/v1\0" + canon).hexdigest())
 PY
@@ -141,7 +158,7 @@ test_stage_is_idempotent_for_same_content_and_a_conflict_otherwise() {
   assert_equals "$first" "$(db_field "$db" cos-2 message_hash)" "a conflict changes nothing"
   run 3 "different epoch, same id" python3 "$BROKER" --db "$db" stage --dispatch-id cos-2 --vp-id vp/ai-harness/primary \
     --owner-machine-key mk-1 --owner-epoch 5 --chief-generation 7 --staged-by-machine-key mk-1 \
-    --created-at 2026-09-26T10:00:00Z --expires-at 2026-09-27T10:00:00Z --body-file "$BODY_FILE"
+    --created-at "$STAGED_AT" --expires-at "$DEADLINE_AT" --body-file "$BODY_FILE"
   assert_contains "$OUT" "owner_epoch" "a differing owner epoch is named"
   assert_equals 4 "$(db_field "$db" cos-2 owner_epoch)" "the staged epoch is unchanged"
   pass "same id and hash is idempotent; same id with different content, target or epoch is a terminal conflict"
@@ -156,7 +173,7 @@ test_stage_refuses_invalid_input_before_any_change() {
   run 2 "bad timestamp" python3 "$BROKER" --db "$db" stage --dispatch-id cos-3 --vp-id vp --owner-machine-key mk \
     --owner-epoch 1 --chief-generation 1 --staged-by-machine-key mk --created-at "2026-09-26 10:00" --body-file "$BODY_FILE"
   assert_contains "$OUT" "RFC 3339" "bad timestamp is named"
-  run 2 "expiry before creation" stage "$db" cos-3 --body-file "$BODY_FILE" --expires-at 2026-09-26T09:00:00Z
+  run 2 "expiry before creation" stage "$db" cos-3 --body-file "$BODY_FILE" --expires-at "$BEFORE_STAGED_AT"
   assert_contains "$OUT" "not after created_at" "inverted expiry is named"
   run 2 "ttl too long" python3 "$BROKER" --db "$db" stage --dispatch-id cos-3 --vp-id vp --owner-machine-key mk \
     --owner-epoch 1 --chief-generation 1 --staged-by-machine-key mk --ttl-seconds 90000 --body-file "$BODY_FILE"
@@ -285,16 +302,16 @@ test_expired_object_yields_receipt_and_the_body_is_nulled() {
   home=$(new_home expiry)
   db="$home/dispatch-bodies.sqlite3"
   run 0 "stage" stage "$db" cos-7 --body-file "$BODY_FILE"
-  run 4 "claim after the deadline" "$RECEIVE" --db "$db" --dispatch-id cos-7 --vp-id vp/ai-harness/primary --route native --now 2026-09-27T10:00:00Z
+  run 4 "claim after the deadline" "$RECEIVE" --db "$db" --dispatch-id cos-7 --vp-id vp/ai-harness/primary --route native --now "$DEADLINE_AT"
   assert_equals expired "$(json receipt.state)" "a claim at the deadline finds it expired"
   assert_not_contains "$OUT" "invoke your /next" "no body after expiry"
   assert_equals "<NULL>" "$(db_field "$db" cos-7 body_utf8)" "expiry NULLs the body in the database"
   run 0 "stage another" stage "$db" cos-8 --body-file "$BODY_FILE"
-  run 0 "expire-due sweep" python3 "$BROKER" --db "$db" --now 2026-09-28T00:00:00Z expire-due
+  run 0 "expire-due sweep" python3 "$BROKER" --db "$db" --now "$PAST_DEADLINE_AT" expire-due
   assert_contains "$OUT" "cos-8" "the sweep names what it expired"
   assert_equals "<NULL>" "$(db_field "$db" cos-8 body_utf8)" "the sweep NULLs the body"
   run 0 "stage a live one" stage "$db" cos-9 --body-file "$BODY_FILE"
-  run 0 "sweep before deadline" python3 "$BROKER" --db "$db" --now 2026-09-26T12:00:00Z expire-due
+  run 0 "sweep before deadline" python3 "$BROKER" --db "$db" --now "$WITHIN_WINDOW_AT" expire-due
   assert_equals 0 "$(json count)" "a sweep before the deadline expires nothing"
   assert_equals staged "$(db_field "$db" cos-9 state)" "positive control: a live object stays staged"
   pass "unclaimed expiry records expired, NULLs the body, and returns only a receipt"
@@ -391,17 +408,17 @@ test_cleanup_removes_only_journaled_old_receipts() {
   hash=$(json receipt.message_hash)
   run 0 "claim" "$RECEIVE" --db "$db" --dispatch-id cos-14 --vp-id vp/ai-harness/primary --route native
   token=$(json claim_token)
-  run 0 "inject" python3 "$BROKER" --db "$db" --now 2026-09-26T11:00:00Z inject --dispatch-id cos-14 --claim-token "$token"
+  run 0 "inject" python3 "$BROKER" --db "$db" --now "$WITHIN_WINDOW_AT" inject --dispatch-id cos-14 --claim-token "$token"
   run 0 "stage unjournaled" stage "$db" cos-15 --body-file "$BODY_FILE"
   run 0 "claim" "$RECEIVE" --db "$db" --dispatch-id cos-15 --vp-id vp/ai-harness/primary --route native
   token=$(json claim_token)
-  run 0 "inject" python3 "$BROKER" --db "$db" --now 2026-09-26T11:00:00Z inject --dispatch-id cos-15 --claim-token "$token"
-  run 2 "cleanup without a journal" python3 "$BROKER" --db "$db" --now 2026-10-10T00:00:00Z cleanup --journal "$journal"
+  run 0 "inject" python3 "$BROKER" --db "$db" --now "$WITHIN_WINDOW_AT" inject --dispatch-id cos-15 --claim-token "$token"
+  run 2 "cleanup without a journal" python3 "$BROKER" --db "$db" --now "$AFTER_RETENTION_AT" cleanup --journal "$journal"
   assert_contains "$OUT" "journal" "a missing journal refuses cleanup"
   printf '{"dispatch_id":"cos-14","message_hash":"%s","state":"injected"}\n' "$hash" > "$journal"
-  run 0 "cleanup too early" python3 "$BROKER" --db "$db" --now 2026-09-30T00:00:00Z cleanup --journal "$journal"
+  run 0 "cleanup too early" python3 "$BROKER" --db "$db" --now "$BEFORE_RETENTION_AT" cleanup --journal "$journal"
   assert_equals "[]" "$(json removed)" "receipts younger than seven days stay"
-  run 0 "cleanup after retention" python3 "$BROKER" --db "$db" --now 2026-10-10T00:00:00Z cleanup --journal "$journal"
+  run 0 "cleanup after retention" python3 "$BROKER" --db "$db" --now "$AFTER_RETENTION_AT" cleanup --journal "$journal"
   assert_equals '["cos-14"]' "$(json removed)" "only the journaled receipt is removed"
   assert_equals '["cos-15"]' "$(json kept_unjournaled)" "the unjournaled receipt is kept and named"
   assert_equals "<no-row>" "$(db_field "$db" cos-14 state)" "removed row is gone"
