@@ -382,54 +382,57 @@ Every write runs under `BEGIN IMMEDIATE` with `synchronous=FULL` and `secure_del
 [`bin/fm-forward-receive.sh`](../bin/fm-forward-receive.sh) is what the owning chief runs from a forwarded, non-operational doorbell: it checks the forwarded owner epoch (a mismatch is `stale-owner`, exit 3, naming the current epoch) and hash, and returns metadata only so local transport selection can start. It never claims and never prints the body; only the target VP's own `fm-receive` claim can.
 The database path is named, never guessed: `--db`, then `FM_DISPATCH_BODY_DB`, then `$FM_HOME/dispatch-bodies.sqlite3`.
 Not yet enforced by these tools: the peer-credential Unix socket and the per-VP process check (they need the machine registry), and the machine singleton lock; until those land, naming the target `vp_id` is the gate's authentication in addition to OS file ownership.
-The signed VP-owner record now has a signer, a verifier and a trust registry in [`bin/fm-vp-owner.py`](../bin/fm-vp-owner.py) (below), but the broker does not yet consult one: the compare-and-swap read of the remote authority ref is not implemented.
+The signed VP-owner record has a signer and a verifier in [`bin/fm-vp-owner.py`](../bin/fm-vp-owner.py) (below), and the broker consults neither: the compare-and-swap read of the remote authority ref is not implemented, so the owner epoch a forwarded doorbell carries is checked against the local staged record and against nothing else.
 
-### VP-owner authority (vp-owner-trust.json / chief-routes.json)
+### VP-owner authority (vp-owner self.json / chief-routes.json)
 
-Nothing about VP ownership is self-asserted.
-[`bin/fm-vp-owner.py`](../bin/fm-vp-owner.py) (standard-library Python plus the `openssl` CLI for Ed25519) owns signer identity, the trust registry, owner-record signing and verification, and owner-route resolution.
-Every command prints exactly one JSON object and exits 0 for ok, 2 for a refusal that changed nothing, 3 for a conflict, and 4 for a failed trust check whose `failed_check` field names the check that said no.
+VP ownership is self-asserted, and the tool's job is to make a record say exactly one consistent thing rather than to decide who may own a VP.
+[`bin/fm-vp-owner.py`](../bin/fm-vp-owner.py) (standard-library Python plus the `openssl` CLI for Ed25519) owns signer identity, unattended self-provisioning, owner-record signing and verification, and owner-route resolution.
+Every command prints exactly one JSON object and exits 0 for ok, 2 for a refusal that changed nothing, 3 for a conflict, and 4 for a document check whose `failed_check` field names the check that said no.
+Warnings go to stderr and never change an exit code, so nothing here can stop a machine dispatching.
 
-`keygen --key-dir DIR` generates this machine's Ed25519 keypair in a caller-owned 0700 directory, writes the private key 0600, and prints only `key_id` and the base64url public key.
-The key id is `ed25519-sha256:<lowercase hex SHA-256 of the raw 32-byte public key>`, so a registry cannot bind a key id to someone else's key.
-The private key is never printed, copied, or logged, and `DIR` is refused when it is not owned by the caller, is readable by others, or resolves under an installer-owned root such as `/etc` or `/var/lib` (a symlink into one is resolved and refused too).
+`self-provision --state-dir DIR --machine-key K` is the install path, and `install.sh` runs it unattended on every machine.
+It is idempotent: a healthy second run generates no key, rewrites nothing, and reports `healed: []`.
+`DIR` holds `self.json` (0600) and `keys/<key-id>.key` (0600) inside 0700 directories it creates, including any missing parents, so a machine that has never been provisioned provisions itself.
+Anything about that state that has drifted is healed rather than refused, and each repair is named in `healed` and written to stderr as `warning: <name>: <reason>`: a missing or unparseable `self.json` is rewritten from the key on disk (`self-missing`, `self-unparseable`), a `self.json` naming a key that is not there adopts the key that is (`self-key-missing`), a hand-edited `machine_key` loses to the argument (`self-machine-key`), a `public_key` or `key_id` that disagrees with the key file is rewritten from the file (`self-key-id`), a loosened directory mode is tightened (`state-dir-mode`), and a first provision generates the one key it needs (`key-generated`).
+Fields the schema does not define, including any left by an earlier revision of this tool, are dropped on the next rewrite rather than treated as an error.
+It exits 2 only when the filesystem genuinely refuses: another OS identity owns the directory, the path resolves under an installer-owned root such as `/etc` or `/var/lib`, or the write fails.
 
-`enroll-request` emits the canonical enrollment request a human verifies out of band: machine key, chief instance key, public key, key id, a one-use nonce, and a proof of possession signed over `ai-harness/vp-owner-enroll/v1\0` plus the RFC 8785 canonical request.
-The machine stays non-dispatching until Sergei verifies it, root-signs a registry revision naming that key `active`, and that revision is installed.
+`self.json` is canonical JSON plus one trailing LF with exactly `schema_version` 1, `machine_key`, `chief_instance_key`, `key_id`, `public_key` and `provisioned_at`; see [docs/examples/vp-owner-self.json](examples/vp-owner-self.json).
+`machine_key` is whatever the caller supplies (on the fleet, `AI_MACHINE_ID`), and `chief_instance_key` is always `firstmate-chief/<machine_key>`, derived rather than configured.
+
+`keygen --key-dir DIR` is the lower-level half of that: it generates one Ed25519 keypair in a caller-owned 0700 directory, writes the private key 0600, and prints only `key_id` and the base64url public key.
+The key id is `ed25519-sha256:<lowercase hex SHA-256 of the raw 32-byte public key>`, so a record cannot name one key id while carrying another key's material.
+The private key is never printed, copied, or logged, and `DIR` is refused when it is not owned by the caller, is readable by others, or resolves under an installer-owned root (a symlink into one is resolved and refused too).
 
 `sign-owner` and `verify-owner` handle the owner-record envelope.
-The stored blob is RFC 8785 canonical JSON plus exactly one trailing LF, with `schema_version`, `protected` (`alg`, `key_id`, `trust_registry_revision`), `payload` (`vp_id`, `owner_machine_key`, `owner_epoch`, `ownership_state`, `predecessor_object_id`, `handoff`, `chief_instance_key`, RFC 3339 UTC-seconds `signed_at`), and `signature`.
+The stored blob is RFC 8785 canonical JSON plus exactly one trailing LF, with `schema_version`, `protected` (`alg`, `key_id`, `public_key`), `payload` (`vp_id`, `owner_machine_key`, `owner_epoch`, `ownership_state`, `predecessor_object_id`, `handoff`, `chief_instance_key`, RFC 3339 UTC-seconds `signed_at`), and `signature`.
+The record carries its own public key, so it is self-verifying: `verify-owner --record PATH` needs no other file.
 The signature is unpadded base64url Ed25519 over `ASCII("ai-harness/vp-owner/v1\0")` followed by the canonical JSON of `{"protected": ..., "payload": ...}`.
-`verify-owner` rejects, naming the check: a blob that is not byte-for-byte that canonical serialization, another algorithm, a missing or unknown field, a non-canonical timestamp or base64 value, a bad signature, an unknown key id, a revoked binding regardless of when the record was signed, a `signed_at` outside the binding's `not_before`/`not_after`, an `owner_machine_key` or `chief_instance_key` the binding contradicts, a record whose `trust_registry_revision` is newer than the installed registry, and an installed registry that fails its own verification.
-`trust_registry_revision` is signing provenance rather than an equality fence, so an unrelated enrollment or a root-signed expiry renewal keeps verifying an existing record with no re-signing.
+`ownership_state` is `active`, `handoff-prepared` or `transferred`.
+`verify-owner` rejects, naming the check, only what makes the document invalid: a blob that is not byte-for-byte that canonical serialization (`canonical-serialization`), a wrong `schema_version`, a missing or unknown field (`structure`), another algorithm (`alg`), a non-canonical base64 value (`base64`) or timestamp (`timestamp`), a `key_id` that is not the SHA-256 of the `public_key` beside it (`key-id-mismatch`), a `chief_instance_key` that does not derive from its own `owner_machine_key` (`chief-binding`), and a bad signature (`signature`).
+There is no expiry, no signer registry, no signing window and no revocation, so no well-formed record is ever rejected for a trust reason.
+`--expected-owner-machine-key K` is the one identity expectation a caller can state, and a disagreement is a soft warning: `verified: true`, exit 0, the reason in `warnings` and the same line on stderr.
 
-The trust registry is `vp-owner-trust.json` with a detached `vp-owner-trust.json.sig`; see [docs/examples/vp-owner-trust.json](examples/vp-owner-trust.json).
-It is canonical JSON with `schema_version` 1, a strictly increasing `registry_revision`, `issued_at`, `expires_at`, and a `signers` array binding each key id to exactly one `machine_key`, `chief_instance_key`, public key, lifecycle status (`active`, `retiring`, `retired`, `revoked`), `not_before`, and optional `not_after`, `revoked_at` and `supersedes`.
-A duplicate key id, a public key bound twice, or a second `active` binding for one machine is invalid, and a rotation therefore marks the outgoing key `retiring` rather than leaving two keys active.
-`registry-verify --registry PATH --root-pub PATH` checks all of that plus the detached signature; `registry-install --registry PATH --root-pub PATH --into DIR` installs it atomically (temp plus rename, signature first) into a caller-owned 0700 directory and refuses an expired, unsigned, locally edited, or rolled-back registry while leaving the installed file byte-identical.
-The root public key is always an explicit `--root-pub`: there is no default path and `/etc` is never read, so the tool cannot silently trust an unpinned root.
-
-`registry-sign --registry PATH --root-key PATH` is the offline-root helper for signing time and for tests, and it is never run on a chief machine in production because the fleet root private key is never installed on one.
-It refuses a non-canonical registry; `--canonicalize` first rewrites the human-readable file into the canonical serialization it then signs, so the reviewed file and the signed bytes are the same object.
+`sign-owner` takes its key from `--state-dir DIR` (the self-provisioned identity) or an explicit `--private-key PATH`, and consults nothing else.
+It refuses (exit 2) only a record it would not itself verify: a bad identifier, a `chief_instance_key` that does not derive from `owner_machine_key`, a `handoff-prepared` state with no `handoff` object, or a `handoff.next_owner_epoch` that does not advance past `owner_epoch`.
+Signing does not publish: the compare-and-swap write to `refs/ai-harness/vp-owners/<escaped-vp-id>` is outside this tool.
 
 `route-resolve --routes chief-routes.json --owner-machine-key K --owner-epoch E --local-machine-key L` answers where a dispatch goes; see [docs/examples/chief-routes.json](examples/chief-routes.json).
 When `K` equals `L` it reports `owner_route_status: local` and `dispatch_authority: local-owner`, which still needs this machine's chief lock and current authority record that this tool does not hold.
 Otherwise exactly one row keyed by `machine_key`, carrying `route_revision`, `chief_instance_key`, `native_agent_name`, `agent_mail.project_key`/`agent_name` and `fm_send.ssh_host`/`firstmate_task_id`, yields `owner_route_status: resolved` and the ordered `native`, `agent-mail`, `fm-send` endpoints of the owning chief.
-A missing, duplicate or incomplete row, or a `chief_instance_key` the installed registry contradicts when `--registry` is given, yields `owner_route_status: unresolved`, `dispatch_authority: forwarding-blocked`, the offending field in `invalid_field`, and exit 2.
+A missing, duplicate or incomplete row yields `owner_route_status: unresolved`, `dispatch_authority: forwarding-blocked`, the offending field in `invalid_field`, and exit 2, which is a routing answer - there is no address for this owner - rather than an authority decision.
 `direct_vp_delivery` is never true for a remote owner, so an unresolved route can never degrade into addressing the VP directly.
 
-#### Privileged boundary (not implemented here)
+#### What this tool does not do
 
-Each item below needs a privileged write, a remote ref write, or a human decision, so this tool leaves it out rather than improvising around it.
+It performs no remote ref write, no network I/O and no privileged write: the compare-and-swap writes to `refs/ai-harness/vp-owners/<escaped-vp-id>` (first claim, active update, prepare-handoff, activate-successor) are outside it, and it writes only into a directory the caller names and owns.
+Also outside it: the machine singleton lock, the machine-global owner record, and any system service, launchd or systemd unit, or `sudo` operation.
 
-- `/etc/ai-harness/trust/vp-owner-root.pub`: provisioning the offline fleet-root public key and pinning its SHA-256 fingerprint in the human-reviewed installer release manifest.
-- `/var/lib/ai-harness/keys/vp-owner/<key-id>.key`: placing the machine signer private key in the installer-owned directory belonging to the designated chief OS identity.
-- `/var/lock/ai-harness/firstmate-chief/<machine-key>.owner.lock` and `/var/lib/ai-harness/firstmate-chief/<machine-key>/owner.json`: the machine singleton lock and the machine-global owner record.
-- `/etc/ai-harness/machine-id`: the installer-generated machine identity that makes `machine_key` non-caller-controlled; here it is an argument, so the tool proves signature and binding consistency, never that the asserted machine key is this machine's.
-- Remote compare-and-swap writes to `refs/ai-harness/vp-owners/<escaped-vp-id>` on the canonical `ai-harness` remote: first claim, active update, prepare-handoff, and activate-successor. This tool signs and verifies the objects those writes carry and performs no ref write and no network I/O.
-- Offline-root signing of a registry revision, which happens on the offline root host.
-- Lost-key recovery authorization: the short-lived, single-use, root-signed authorization bound to `vp_id`, the exact current object id and epoch, the revoked key id, the destination machine and key id, the next epoch, a nonce, and an expiry.
-- Any system service, launchd or systemd unit, or `sudo` operation.
+Ownership is self-asserted, recorded here once as the trade it is rather than as a warning.
+Any process that can write that ref namespace or a local file under the state directory can assert a VP identity, and nothing detects a forged or hand-edited record beyond the record's own internal consistency.
+That is acceptable because every machine in scope is Sergei's own and there is no adversary in the threat model; an authority layer that can block a machine, expire, or need a human step is worth less here than one that always provisions itself.
+`machine_key` is therefore an argument rather than a machine-attested identity, and the tool proves a record is internally consistent, never that the asserted machine key is this machine's.
 
 ## Backlog backend (.tasks.toml / config/backlog-backend)
 

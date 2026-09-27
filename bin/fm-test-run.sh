@@ -1484,7 +1484,7 @@ families_for_changed_path() {
       printf '%s\n' "__script__:fm-dispatch-body.test.sh"
       ;;
     bin/fm-vp-owner.py)
-      # The VP-owner authority layer (signer identity, trust registry, owner
+      # The VP-owner authority layer (signer identity, self-provisioning, owner
       # records, owner-route resolution) is proven by one suite.
       printf '%s\n' "__script__:fm-vp-owner.test.sh"
       ;;

@@ -357,7 +357,7 @@
       "audience": "operator-example"
     },
     {
-      "path": "docs/examples/vp-owner-trust.json",
+      "path": "docs/examples/vp-owner-self.json",
       "audience": "operator-example"
     },
     {
