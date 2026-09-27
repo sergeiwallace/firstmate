@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "routes": [
+    {
+      "machine_key": "b7c1f0d2-3e45-4a89-9f10-6d2b8c4e7a51",
+      "route_revision": 3,
+      "chief_instance_key": "firstmate-chief/b7c1f0d2-3e45-4a89-9f10-6d2b8c4e7a51",
+      "native_agent_name": "cos-framework-fedora",
+      "agent_mail": {
+        "project_key": "fleet",
+        "agent_name": "cos-framework-fedora"
+      },
+      "fm_send": {
+        "ssh_host": "framework-fedora",
+        "firstmate_task_id": "cos"
+      }
+    },
+    {
+      "machine_key": "e2a94c17-8b06-4d3f-a571-0c9e4b18d6f2",
+      "route_revision": 3,
+      "chief_instance_key": "firstmate-chief/e2a94c17-8b06-4d3f-a571-0c9e4b18d6f2",
+      "native_agent_name": "cos-hetzner",
+      "agent_mail": {
+        "project_key": "fleet",
+        "agent_name": "cos-hetzner"
+      },
+      "fm_send": {
+        "ssh_host": "hetzner",
+        "firstmate_task_id": "cos"
+      }
+    }
+  ]
+}
