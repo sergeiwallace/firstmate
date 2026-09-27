@@ -165,7 +165,7 @@ test_keygen_refuses_a_privileged_or_unowned_directory_without_writing() {
   run 2 "under /var/lib" python3 "$TOOL" keygen --key-dir /var/lib/ai-harness/keys/vp-owner
   assert_contains "$OUT" "/var/lib" "the /var/lib key root is refused too"
   run 2 "the root directory" python3 "$TOOL" keygen --key-dir /
-  assert_contains "$OUT" "never a key or trust directory" "/ is refused"
+  assert_contains "$OUT" "never a key or state directory" "/ is refused"
   if [ "$(stat -c %u / 2>/dev/null || stat -f %u /)" != "$(id -u)" ]; then
     run 2 "a directory this identity does not own" python3 "$TOOL" keygen --key-dir /
     assert_contains "$OUT" "refused" "an unowned directory refuses"
@@ -228,7 +228,15 @@ PY
   assert_equals "$(file_json "$dir/vp-owner/self.json" key_id)" "$(json key_id)" "the record is signed by the provisioned key"
   run 0 "and that record verifies" python3 "$TOOL" verify-owner --record "$dir/owner.json"
   assert_equals True "$(json verified)" "the provisioned identity produces a verifiable record"
-  pass "self-provision creates a 0600 key and a canonical 0600 self.json in a 0700 directory, prints no key material, and yields a usable signing identity"
+  # The installer's own call shape: a state directory several levels below anything
+  # that exists yet. This is what install.sh runs on a machine that has never been
+  # provisioned, so it has to create the chain rather than refuse a missing parent.
+  run_split 0 "the installer's state path is created from nothing" python3 "$TOOL" \
+    self-provision --state-dir "$dir/fresh-home/ai-harness/vp-owner" --machine-key mk-1
+  assert_equals '["key-generated"]' "$(json healed)" "a never-provisioned machine provisions itself"
+  assert_equals 700 "$(mode_of "$dir/fresh-home/ai-harness")" "the created parent is 0700 too"
+  assert_present "$dir/fresh-home/ai-harness/vp-owner/self.json" "the self record lands at the named path"
+  pass "self-provision creates a 0600 key and a canonical 0600 self.json in a 0700 directory it will create from nothing, prints no key material, and yields a usable signing identity"
 }
 
 test_a_second_self_provision_run_changes_nothing() {
