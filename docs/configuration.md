@@ -13,6 +13,7 @@ Start with the directory layout, then use the setting reference for the behavior
 | Backlog, preferences, and memory | [Backlog backend](#backlog-backend-taskstoml--configbacklog-backend), [captain preferences](#captain-preferences-datacaptainmd--datacaptain-sharedmd), and [startup memory budget](#startup-memory-budget-configstartup-memory-budget) |
 | Supervision and presentation | [Pi supervision branch](#pi-supervision-branch), [supervision host](#supervision-host-configsupervision-host), and [Calm preference](#calm-preference-configcalm) |
 | Persistent secondmates | [Secondmate routes](#secondmate-routes-datasecondmatesmd) |
+| Chief-of-staff dispatch transports and a required task adapter | [Message transports](#message-transports-configmessage-transportsjson) and [required backend](#required-backend-configbacklog-backend-required) |
 | Per-run overrides and tuning | [Environment variables](#environment-variables) |
 
 ## FM_HOME
@@ -331,10 +332,120 @@ The file is read at every wake, so a change applies at the next one without a re
 It is local to each home and not part of secondmate inherited configuration.
 While the file exists, main's lease-checked commands also take the per-task lease lock, so a claim by the host's engine cannot race a mutation main already started (`bin/fm-lease-lib.sh`).
 
+## Message transports (config/message-transports.json)
+
+A chief-of-staff home reaches the sessions it coordinates through a chain of transports it declares in `config/message-transports.json`.
+Native `ListAgents`/`SendMessage` is always the primary, because the outcomes the chain reasons about - a held copy, a copy accepted for an offline session, a delivered copy never activated - are native's own.
+Everything after it is declared: `fallbacks` is any subset of the known fallback adapters, Agent Mail and this repo's existing `fm-send.sh` route, in any order, and it may be empty.
+**No fallback adapter is mandatory.** A home with no Agent Mail configured declares `"fallbacks": ["fm-send"]` and the chain works; a home with neither declares `[]` and the chain begins and ends at native.
+The loader still fails closed, naming the field, on anything outside that: an unknown adapter, `native` named as a fallback, a repeated adapter, a missing `fallbacks` key, an unknown key, or a timeout out of range.
+[`docs/examples/message-transports.json`](examples/message-transports.json) is the fleet default, which uses all three:
+
+```json
+{
+  "schema_version": 1,
+  "primary": "native",
+  "fallbacks": ["agent-mail", "fm-send"],
+  "offline_pending_timeout_seconds": 600,
+  "native_activation_timeout_seconds": 600
+}
+```
+
+| Field | Accepted value |
+| --- | --- |
+| `schema_version` | `1` |
+| `primary` | `"native"` |
+| `fallbacks` | an array of distinct known fallback adapters (`"agent-mail"`, `"fm-send"`) in the order they should be attempted; may be empty; never `"native"` |
+| `offline_pending_timeout_seconds` | whole seconds, 60-3600; default 600 when omitted |
+| `native_activation_timeout_seconds` | whole seconds, 60-3600; default 600 when omitted |
+
+Any unknown key, an unknown or repeated adapter, or a timeout that is zero, negative, fractional, or outside the range is refused before dispatch rather than clamped.
+[`bin/fm-message-transport.sh`](../bin/fm-message-transport.sh) is the command-line face of the policy ([`bin/fm-message-transport-lib.sh`](../bin/fm-message-transport-lib.sh) owns it): `--dry-run` validates and prints the declared chain (`native -> agent-mail -> fm-send` for the default, `native` alone for an empty list); `next <transport> <outcome>` answers what the policy allows after one attempt; `deadline` computes the durable accepted-offline or activation deadline once from the acceptance time; `check-dispatch` refuses a bare slash command, an unnamed skill, or a missing acknowledgement line before anything is sent.
+Like `fm-send.sh`, the command requires `FM_HOME` (or `FM_CONFIG_OVERRIDE`) to be named rather than guessing a home; `next` reads the config too, because the successor of an adapter is a property of the declared chain.
+
+`next` maps each (adapter, outcome) pair to an outcome class - keep waiting, advance, done, or stop - and resolves that class against the declared chain, so the answer follows the config rather than a fixed successor.
+An outcome that advances names the adapter declared after the one that reported it, and `stop:exhausted` when nothing is declared after it, so a chain of any length terminates.
+An adapter the chain does not declare is refused rather than answered: with `"fallbacks": ["fm-send"]`, `next agent-mail pending` exits 2 naming the declared chain.
+The two timeouts govern when a native copy that was accepted for an offline session, or delivered but never claimed by the recipient, releases the next declared fallback; a held native copy stays pending until Claude Code's documented terminal hold outcome and never releases a fallback.
+Nothing in this policy sends a message: the native adapter is owned by the coordinating agent, and `fm-send.sh` keeps its own exit and delivery contract unchanged when the chain reaches it.
+
+### Dispatch-body broker (dispatch-bodies.sqlite3)
+
+The operational text of a dispatch never travels as authority. The owning chief home holds one SQLite database, `dispatch-bodies.sqlite3`, and [`bin/fm-dispatch-body.py`](../bin/fm-dispatch-body.py) (standard-library Python; no `sqlite3` CLI needed) is its only writer.
+`stage` commits one record before any transport is attempted: `schema_version` 1, the dispatch id, target `vp_id`, `owner_machine_key`, `owner_epoch`, `chief_generation`, `staged_by_machine_key`, the exact rendered `body_utf8` with no normalization, RFC 3339 UTC `created_at` and `expires_at` (default 24 h, only ever shortened, never below 60 s), and `message_hash` = lowercase-hex SHA-256 of `firstmate-dispatch-body/v1\0` followed by the RFC 8785 canonical JSON of those fields.
+Staging the same id with the same hash again is idempotent; the same id with a different body, target, epoch or timestamp is a terminal conflict (exit 3) and nothing is sent.
+Every write runs under `BEGIN IMMEDIATE` with `synchronous=FULL` and `secure_delete=ON`, followed by a directory fsync; the database is created 0600 and the broker refuses (exit 2) a database or home that another OS identity owns or could read or replace.
+
+[`bin/fm-receive.sh`](../bin/fm-receive.sh) is the recipient's claim gate. Whichever transport arrives first calls it with the dispatch id, the addressed `vp_id` and its route (`native`, `agent-mail`, `fm-send`), plus `--expected-hash` when the envelope carried one. One transaction moves `staged` to `claimed`, records the winning route and an unguessable claim token, and returns `body_utf8` to that caller alone (exit 0), also writing the `$FM_HOME/state/dispatch-inbox/<id>.json` receipt projection with `O_CREAT|O_EXCL`. Every other caller gets the stored receipt and never the body (exit 4): a loser route, a late doorbell after a fallback won, an expired or unknown id. The wrong target VP is refused (exit 2) and a mismatched envelope hash conflicts (exit 3), both leaving the object staged.
+`resume` re-reads a claimed body only with its own claim token; `inject` and `terminal` finish the claim and set the body to NULL in the same transaction; `reconcile-required` records a claimed row whose token or enqueue outcome cannot be proven, NULLs the body, and is never reset to staged; `expire-due` expires unclaimed rows past their deadline; `cleanup --journal <dispatch.jsonl>` removes finished receipts older than seven days only when the append-only journal already holds the same id, hash and terminal state.
+
+[`bin/fm-forward-receive.sh`](../bin/fm-forward-receive.sh) is what the owning chief runs from a forwarded, non-operational doorbell: it checks the forwarded owner epoch (a mismatch is `stale-owner`, exit 3, naming the current epoch) and hash, and returns metadata only so local transport selection can start. It never claims and never prints the body; only the target VP's own `fm-receive` claim can.
+The database path is named, never guessed: `--db`, then `FM_DISPATCH_BODY_DB`, then `$FM_HOME/dispatch-bodies.sqlite3`.
+Not yet enforced by these tools: the peer-credential Unix socket and the per-VP process check (they need the machine registry), and the machine singleton lock; until those land, naming the target `vp_id` is the gate's authentication in addition to OS file ownership.
+The signed VP-owner record has a signer and a verifier in [`bin/fm-vp-owner.py`](../bin/fm-vp-owner.py) (below), and the broker consults neither: the compare-and-swap read of the remote authority ref is not implemented, so the owner epoch a forwarded doorbell carries is checked against the local staged record and against nothing else.
+
+### VP-owner authority (vp-owner self.json / chief-routes.json)
+
+VP ownership is self-asserted, and the tool's job is to make a record say exactly one consistent thing rather than to decide who may own a VP.
+[`bin/fm-vp-owner.py`](../bin/fm-vp-owner.py) (standard-library Python plus the `openssl` CLI for Ed25519) owns signer identity, unattended self-provisioning, owner-record signing and verification, and owner-route resolution.
+Every command prints exactly one JSON object and exits 0 for ok, 2 for a refusal that changed nothing, 3 for a conflict, and 4 for a document check whose `failed_check` field names the check that said no.
+Warnings go to stderr and never change an exit code, so nothing here can stop a machine dispatching.
+
+`self-provision --state-dir DIR --machine-key K` is the install path, and `install.sh` runs it unattended on every machine.
+It is idempotent: a healthy second run generates no key, rewrites nothing, and reports `healed: []`.
+`DIR` holds `self.json` (0600) and `keys/<key-id>.key` (0600) inside 0700 directories it creates, including any missing parents, so a machine that has never been provisioned provisions itself.
+Anything about that state that has drifted is healed rather than refused, and each repair is named in `healed` and written to stderr as `warning: <name>: <reason>`: a missing or unparseable `self.json` is rewritten from the key on disk (`self-missing`, `self-unparseable`), a `self.json` naming a key that is not there adopts the key that is (`self-key-missing`), a hand-edited `machine_key` loses to the argument (`self-machine-key`), a `public_key` or `key_id` that disagrees with the key file is rewritten from the file (`self-key-id`), a loosened directory mode is tightened (`state-dir-mode`), and a first provision generates the one key it needs (`key-generated`).
+Fields the schema does not define, including any left by an earlier revision of this tool, are dropped on the next rewrite rather than treated as an error.
+It exits 2 only when the filesystem genuinely refuses: another OS identity owns the directory, the path resolves under an installer-owned root such as `/etc` or `/var/lib`, or the write fails.
+
+`self.json` is canonical JSON plus one trailing LF with exactly `schema_version` 1, `machine_key`, `chief_instance_key`, `key_id`, `public_key` and `provisioned_at`; see [docs/examples/vp-owner-self.json](examples/vp-owner-self.json).
+`machine_key` is whatever the caller supplies (on the fleet, `AI_MACHINE_ID`), and `chief_instance_key` is always `firstmate-chief/<machine_key>`, derived rather than configured.
+
+`keygen --key-dir DIR` is the lower-level half of that: it generates one Ed25519 keypair in a caller-owned 0700 directory, writes the private key 0600, and prints only `key_id` and the base64url public key.
+The key id is `ed25519-sha256:<lowercase hex SHA-256 of the raw 32-byte public key>`, so a record cannot name one key id while carrying another key's material.
+The private key is never printed, copied, or logged, and `DIR` is refused when it is not owned by the caller, is readable by others, or resolves under an installer-owned root (a symlink into one is resolved and refused too).
+
+`sign-owner` and `verify-owner` handle the owner-record envelope.
+The stored blob is RFC 8785 canonical JSON plus exactly one trailing LF, with `schema_version`, `protected` (`alg`, `key_id`, `public_key`), `payload` (`vp_id`, `owner_machine_key`, `owner_epoch`, `ownership_state`, `predecessor_object_id`, `handoff`, `chief_instance_key`, RFC 3339 UTC-seconds `signed_at`), and `signature`.
+The record carries its own public key, so it is self-verifying: `verify-owner --record PATH` needs no other file.
+The signature is unpadded base64url Ed25519 over `ASCII("ai-harness/vp-owner/v1\0")` followed by the canonical JSON of `{"protected": ..., "payload": ...}`.
+`ownership_state` is `active`, `handoff-prepared` or `transferred`.
+`verify-owner` rejects, naming the check, only what makes the document invalid: a blob that is not byte-for-byte that canonical serialization (`canonical-serialization`), a wrong `schema_version`, a missing or unknown field (`structure`), another algorithm (`alg`), a non-canonical base64 value (`base64`) or timestamp (`timestamp`), a `key_id` that is not the SHA-256 of the `public_key` beside it (`key-id-mismatch`), a `chief_instance_key` that does not derive from its own `owner_machine_key` (`chief-binding`), and a bad signature (`signature`).
+There is no expiry, no signer registry, no signing window and no revocation, so no well-formed record is ever rejected for a trust reason.
+`--expected-owner-machine-key K` is the one identity expectation a caller can state, and a disagreement is a soft warning: `verified: true`, exit 0, the reason in `warnings` and the same line on stderr.
+
+`sign-owner` takes its key from `--state-dir DIR` (the self-provisioned identity) or an explicit `--private-key PATH`, and consults nothing else.
+It refuses (exit 2) only a record it would not itself verify: a bad identifier, a `chief_instance_key` that does not derive from `owner_machine_key`, a `handoff-prepared` state with no `handoff` object, or a `handoff.next_owner_epoch` that does not advance past `owner_epoch`.
+Signing does not publish: the compare-and-swap write to `refs/ai-harness/vp-owners/<escaped-vp-id>` is outside this tool.
+
+`route-resolve --routes chief-routes.json --owner-machine-key K --owner-epoch E --local-machine-key L` answers where a dispatch goes; see [docs/examples/chief-routes.json](examples/chief-routes.json).
+When `K` equals `L` it reports `owner_route_status: local` and `dispatch_authority: local-owner`, which still needs this machine's chief lock and current authority record that this tool does not hold.
+Otherwise exactly one row keyed by `machine_key`, carrying `route_revision`, `chief_instance_key`, `native_agent_name`, `agent_mail.project_key`/`agent_name` and `fm_send.ssh_host`/`firstmate_task_id`, yields `owner_route_status: resolved` and the ordered `native`, `agent-mail`, `fm-send` endpoints of the owning chief.
+A missing, duplicate or incomplete row yields `owner_route_status: unresolved`, `dispatch_authority: forwarding-blocked`, the offending field in `invalid_field`, and exit 2, which is a routing answer - there is no address for this owner - rather than an authority decision.
+`direct_vp_delivery` is never true for a remote owner, so an unresolved route can never degrade into addressing the VP directly.
+
+#### What this tool does not do
+
+It performs no remote ref write, no network I/O and no privileged write: the compare-and-swap writes to `refs/ai-harness/vp-owners/<escaped-vp-id>` (first claim, active update, prepare-handoff, activate-successor) are outside it, and it writes only into a directory the caller names and owns.
+Also outside it: the machine singleton lock, the machine-global owner record, and any system service, launchd or systemd unit, or `sudo` operation.
+
+Ownership is self-asserted, recorded here once as the trade it is rather than as a warning.
+Any process that can write that ref namespace or a local file under the state directory can assert a VP identity, and nothing detects a forged or hand-edited record beyond the record's own internal consistency.
+That is acceptable because every machine in scope is Sergei's own and there is no adversary in the threat model; an authority layer that can block a machine, expire, or need a human step is worth less here than one that always provisions itself.
+`machine_key` is therefore an argument rather than a machine-attested identity, and the tool proves a record is internally consistent, never that the asserted machine key is this machine's.
+
 ## Backlog backend (.tasks.toml / config/backlog-backend)
 
 The tracked `.tasks.toml` pins the default `tasks-axi` markdown backend to `data/backlog.md`, with `done_keep = 10` and an archive at `data/done-archive.md`.
 A home may instead select another tasks-axi adapter such as Beads through its own `.tasks.toml` or `TASKS_AXI_BACKEND`; firstmate still uses only tasks-axi verbs for routine backlog reads and mutations, and the adapter maps `start` and evidence-bearing `done` transitions to its native statuses and evidence fields.
+
+### Required backend (config/backlog-backend-required)
+
+A home that must never fall back to a markdown backlog names its adapter in `config/backlog-backend-required` (for a chief-of-staff home, `beads`).
+When that file is present and non-empty, [`bin/fm-tasks-axi.sh`](../bin/fm-tasks-axi.sh) exits 2 before running tasks-axi, and the automatic dispatch and completion transitions report an error instead of skipping, whenever the resolved adapter differs from the required one, `config/backlog-backend=manual` is also selected, or tasks-axi is missing or below the supported minimum.
+The refusal names both the required and the resolved adapter.
+Without the file every default above is unchanged, including the markdown and manual fallbacks.
+The home's own `.tasks.toml` still selects the adapter; the requirement only refuses to proceed when that selection is not in effect.
 
 ### Captain holds on Beads
 

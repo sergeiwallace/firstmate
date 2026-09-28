@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "primary": "native",
+  "fallbacks": ["agent-mail", "fm-send"],
+  "offline_pending_timeout_seconds": 600,
+  "native_activation_timeout_seconds": 600
+}

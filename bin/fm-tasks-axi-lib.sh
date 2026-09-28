@@ -198,3 +198,51 @@ fm_tasks_axi_backend_available() {
   fm_backlog_backend_manual "$config_dir" && return 1
   fm_tasks_axi_compatible
 }
+
+# Required backend (config/backlog-backend-required): fail closed instead of
+# falling back to markdown or manual editing.
+#
+# A chief-of-staff home is configured so that Beads stays the sole task system
+# of record: `config/backlog-backend-required` names the tasks-axi adapter the
+# home MUST resolve (normally `beads`). When the file is present and non-empty,
+# any routine lifecycle read or mutation refuses - exit 2 from bin/fm-tasks-axi.sh,
+# status 2 with FM_BACKLOG_TRANSITION_ERROR from fm_backlog_transition_applies -
+# whenever the resolved adapter differs, `config/backlog-backend=manual` is also
+# selected, or tasks-axi is missing or below FM_TASKS_AXI_MIN. Without the file
+# every existing default holds, including the markdown and manual fallbacks.
+# The refusal names the required and resolved adapters so an operator can see
+# which side is misconfigured; nothing is ever silently redirected to a
+# markdown file in that home.
+fm_tasks_axi_required_backend() {  # <config-dir> -> prints the required adapter, or nothing
+  local config_dir=$1 required_file value
+  required_file="$config_dir/backlog-backend-required"
+  [ -f "$required_file" ] || return 0
+  value=$(tr -d '[:space:]' < "$required_file" 2>/dev/null || true)
+  [ -n "$value" ] || return 0
+  printf '%s\n' "$value"
+}
+
+FM_TASKS_AXI_REQUIRED_ERROR=
+fm_tasks_axi_required_backend_check() {  # <config-dir> <tasks-axi-working-directory>
+  local config_dir=$1 root=$2 required resolved
+  FM_TASKS_AXI_REQUIRED_ERROR=
+  required=$(fm_tasks_axi_required_backend "$config_dir")
+  [ -n "$required" ] || return 0
+  if fm_backlog_backend_manual "$config_dir"; then
+    FM_TASKS_AXI_REQUIRED_ERROR="config/backlog-backend selects manual editing but config/backlog-backend-required=$required; refusing rather than editing a markdown backlog by hand"
+    return 2
+  fi
+  if ! resolved=$(fm_tasks_axi_backend_resolve "$root" 2>&1); then
+    FM_TASKS_AXI_REQUIRED_ERROR="config/backlog-backend-required=$required but the tasks-axi backend cannot be resolved for $root: $resolved"
+    return 2
+  fi
+  if [ "$resolved" != "$required" ]; then
+    FM_TASKS_AXI_REQUIRED_ERROR="config/backlog-backend-required=$required but tasks-axi resolves backend '$resolved' for $root; refusing the lifecycle operation (no markdown fallback)"
+    return 2
+  fi
+  if ! fm_tasks_axi_compatible; then
+    FM_TASKS_AXI_REQUIRED_ERROR="config/backlog-backend-required=$required needs tasks-axi ${FM_TASKS_AXI_MIN} or newer with the $required adapter on PATH; tasks-axi is missing or incompatible, and there is no manual fallback for this home"
+    return 2
+  fi
+  return 0
+}
