@@ -54,6 +54,14 @@ Launching a supported harness inside it for your primary session instantiates yo
 
 Full detail on every feature lives in [docs/architecture.md](docs/architecture.md).
 
+## About this fork
+
+This repository is a fork of [kunchenguid/firstmate](https://github.com/kunchenguid/firstmate), maintained by Sergei Wallace.
+Everything above describes upstream firstmate and still applies here.
+The fork adds a chief-of-staff authority layer that a separate harness uses to coordinate several interactive agent sessions on one machine: a configurable transport chain, a durable dispatch-body broker with a recipient claim gate, and an unattended machine identity for signing ownership records.
+In that configuration the fork is consumed as a sibling checkout at a pinned commit, with its scripts called from another repository, rather than launched directly as the distro.
+[docs/chief-of-staff-fork-layer.md](docs/chief-of-staff-fork-layer.md) explains what the fork adds, how it is consumed, and what it leaves unchanged.
+
 ## Quick Start
 
 ### Requirements
@@ -234,6 +242,7 @@ Firstmate's skills live in two separate places with different audiences:
 - [docs/verification/supervision.md](docs/verification/supervision.md) - active maintainer verification for session-start, guard, continuity, and wedge integrations.
 - [docs/supervision-protocols/](docs/supervision-protocols/) - rendered primary-harness watcher protocols for Claude, Codex, OpenCode, Pi and `pi-signed`, omp, Grok, Cursor, and unknown harness fallback.
 - [docs/scripts.md](docs/scripts.md) - the `bin/` toolbelt reference.
+- [docs/chief-of-staff-fork-layer.md](docs/chief-of-staff-fork-layer.md) - what this fork adds for a chief-of-staff session and how a separate harness consumes it as a sibling checkout.
 - [docs/documentation-audiences.md](docs/documentation-audiences.md) - documentation audiences and the machine-checked placement boundary.
 - [`AGENTS.md`](AGENTS.md) - the supervisor contract, role boundary, and routing index for conditional procedures.
 - [CONTRIBUTING.md](CONTRIBUTING.md) - how to contribute, including the dev/test commands.

@@ -313,6 +313,10 @@
       "audience": "maintainer-architecture"
     },
     {
+      "path": "docs/chief-of-staff-fork-layer.md",
+      "audience": "operator-current"
+    },
+    {
       "path": "docs/cmux-backend.md",
       "audience": "operator-current"
     },
