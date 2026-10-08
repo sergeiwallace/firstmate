@@ -335,9 +335,12 @@ fm_mt_next() {
 #   named path executable          -> buzz/configured
 #
 # and `buzz/unconfigured` classifies as `advance`, so a home with no Buzz client
-# routes straight on to the next declared adapter rather than stalling. This is
-# the state the whole fleet is in today: the harness-side Buzz client (AIH-zwr6m)
-# has not landed, so nothing writes buzz-client yet and every probe here reports
+# routes straight on to the next declared adapter rather than stalling.
+#
+# The client is the managing harness's own Buzz sender, never a re-implementation
+# here: ai-harness ships it as its `buzz` command (scripts/buzz_cli.py, published
+# to ~/.local/bin/buzz), and the send is `<client> send --to <machine>--<slug>
+# <text>`. A home whose installer has not written buzz-client reports
 # unconfigured by construction.
 #
 # It NEVER executes the client, resolves a host, or opens a socket. A probe that
