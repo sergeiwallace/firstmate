@@ -393,7 +393,7 @@ The probe never executes the client, resolves a host, or opens a socket, and it 
 fm-vp-migrate.sh <vp-name> --repo <path> --dry-run [--home <path>] [--receipt-dir <dir>] [--role <role>]
 ```
 
-It records one line per gate - `vp-record`, `repo-scope`, `charter`, `harness-selection`, `beads-ownership`, `home-seed`, `route-register`, `reconcile`, `native-dispatch-proof`, `cutover` - as `pass`, `fail`, or `skipped`, plus the rollback plan. A dry run writes its receipt to a fresh temp directory unless `--receipt-dir` names one, and never into a live chief home.
+It records one line per gate - `vp-record`, `repo-scope`, `charter`, `harness-selection`, `beads-ownership`, `home-seed`, `route-register`, `reconcile`, `native-dispatch-proof`, `cutover` - as `pass`, `fail`, or `skipped`, plus the rollback plan. A dry run writes its receipt to a fresh temp directory unless `--receipt-dir` names one, and never into a live chief home - that is enforced, not just defaulted: `--receipt-dir`, and the `TMPDIR` the default destination is created under, are resolved to physical paths and refused with status 2 when they land at or under `$FM_HOME`, naming the resolved path. A symlink or a `..` into the home is refused on the resolved spelling, because that is the spelling the write obeys.
 
 **A dry run touches nothing.** It reads session records, and only reads them, matching on each record's own `name` field rather than the pid-keyed file name. The three gates that cannot be observed without a live replacement session - `reconcile`, `native-dispatch-proof`, `cutover` - are always recorded as `skipped(dry-run)` and never as `pass`.
 

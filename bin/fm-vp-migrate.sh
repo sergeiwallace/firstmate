@@ -13,7 +13,9 @@
 #   --home <path>          the secondmate home to seed (default:
 #                          <chief-home>/secondmates/<vp-name>)
 #   --receipt-dir <dir>    where to write <vp>.receipt (default: a fresh
-#                          mktemp -d under a dry run, NEVER the live chief home)
+#                          mktemp -d under a dry run, NEVER the live chief home:
+#                          a value - or a TMPDIR - that resolves at or under
+#                          $FM_HOME is refused with status 2, naming the path)
 #   --sessions-dir <dir>   where VP session records live
 #                          (default: ${XDG_CONFIG_HOME:-$HOME}/.claude/sessions)
 #   --role <role>          the VP's AI_SESSION_ROLE, which a Claude Code session
@@ -73,6 +75,59 @@ usage() {
 refuse() {  # <status> <message>
   printf 'fm-vp-migrate: %s\n' "$2" >&2
   exit "$1"
+}
+
+# physical_path <path>: the physical absolute spelling of <path>, resolved
+# without creating it. The deepest existing ancestor is resolved with `pwd -P`
+# and the missing tail is re-appended, because the receipt directory usually
+# does not exist yet and a comparison against an unresolved spelling is not a
+# comparison: /tmp is a symlink on macOS, `..` and a symlinked --receipt-dir
+# both re-enter directories a literal prefix test says they are outside of.
+# bin/fm-ff-lib.sh ships resolve_path/path_is_ancestor_of for the existing-path
+# case; that library is the git self-sync machinery and requires FM_ROOT and
+# FM_HOME to be set, which this planner deliberately does not, so the two
+# non-existent-tail-safe lines live here instead.
+physical_path() {  # <path>
+  local p=$1 rest= base
+  [ -n "$p" ] || return 1
+  case "$p" in
+    /*) ;;
+    *) p="$(pwd -P)/$p" ;;
+  esac
+  while [ "$p" != / ] && [ ! -d "$p" ]; do
+    rest="$(basename "$p")${rest:+/$rest}"
+    p="$(dirname "$p")"
+  done
+  base=$(CDPATH='' cd -P -- "$p" 2>/dev/null && pwd -P) || base=$p
+  printf '%s' "${base%/}${rest:+/$rest}"
+}
+
+# path_at_or_under <candidate> <ancestor>: true when candidate IS ancestor or
+# sits beneath it. Both arguments must already be physical.
+path_at_or_under() {  # <candidate> <ancestor>
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  [ "$1" != "$2" ] || return 0
+  case "$1" in
+    "$2"/*) return 0 ;;
+  esac
+  return 1
+}
+
+# refuse_inside_chief_home <label> <path>: the "a dry run never lands in the
+# live chief home" guarantee, enforced rather than merely defaulted. Without
+# this it was bypassable - `--receipt-dir "$FM_HOME/state/migrations"`, or
+# TMPDIR pointing into the home, wrote a planner receipt into the live chief
+# home while that same receipt declared nothing live had been touched.
+# <chief-home>/state/migrations/<vp>.receipt belongs to the operator's real
+# cutover, which this script does not perform.
+refuse_inside_chief_home() {  # <label> <path>
+  [ -n "${FM_HOME:-}" ] || return 0
+  local home abs
+  home=$(physical_path "$FM_HOME") || return 0
+  abs=$(physical_path "$2") || return 0
+  if path_at_or_under "$abs" "$home"; then
+    refuse 2 "$1 resolves inside the live chief home: $abs is at or under $home; a dry-run receipt must never land there"
+  fi
 }
 
 VP=
@@ -143,12 +198,23 @@ fi
 # it goes to a fresh temp directory. The live location
 # (<chief-home>/state/migrations/<vp>.receipt) belongs to the operator's real
 # cutover, which this script does not perform.
+#
+# Both spellings of the destination are checked BEFORE anything is created, and
+# the resolved result is checked again afterwards: mktemp follows a symlinked
+# TMPDIR, so the only spelling the guarantee can be stated about is the one the
+# receipt is actually written to.
 if [ -z "$RECEIPT_DIR" ]; then
-  RECEIPT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-vp-migrate.XXXXXX") \
+  TMP_BASE=${TMPDIR:-/tmp}
+  refuse_inside_chief_home "the TMPDIR a default receipt directory would use" "$TMP_BASE"
+  RECEIPT_DIR=$(mktemp -d "${TMP_BASE%/}/fm-vp-migrate.XXXXXX") \
     || refuse 2 "could not create a receipt directory"
 else
+  refuse_inside_chief_home "--receipt-dir" "$RECEIPT_DIR"
   mkdir -p "$RECEIPT_DIR" || refuse 2 "receipt directory is not writable: $RECEIPT_DIR"
 fi
+RECEIPT_DIR=$(physical_path "$RECEIPT_DIR") \
+  || refuse 2 "could not resolve the receipt directory to a physical path"
+refuse_inside_chief_home "the resolved receipt directory" "$RECEIPT_DIR"
 RECEIPT="$RECEIPT_DIR/$VP.receipt"
 
 GATE_LINES=

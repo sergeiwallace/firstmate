@@ -238,6 +238,64 @@ test_a_receipt_never_references_a_live_session() {
   pass "a fixture dry-run receipt references no live session or live sessions directory"
 }
 
+test_a_receipt_destination_inside_the_live_chief_home_is_refused() {
+  local world home receipt_link
+  world=$(make_world receiptguard)
+  # A fixture standing in for a live chief home, with the real live receipt
+  # location under it. Nothing here is this host's actual chief home.
+  home="$world/chief-home"
+  mkdir -p "$home/state/migrations"
+
+  # 1. The live receipt location itself, named directly.
+  run 2 "--receipt-dir inside FM_HOME" \
+    env FM_HOME="$home" "$CLI" vp-receiptguard \
+      --repo "$world/repo" --sessions-dir "$world/sessions" \
+      --home "$world/homes/vp-receiptguard" \
+      --receipt-dir "$home/state/migrations" --dry-run
+  assert_contains "$OUT" "resolves inside the live chief home" "the refusal names the guarantee"
+  assert_contains "$OUT" "$home/state/migrations" "the refusal names the resolved path"
+  assert_absent "$home/state/migrations/vp-receiptguard.receipt" "no receipt may land in the live chief home"
+
+  # 2. FM_HOME itself.
+  run 2 "--receipt-dir equal to FM_HOME" \
+    env FM_HOME="$home" "$CLI" vp-receiptguard \
+      --repo "$world/repo" --sessions-dir "$world/sessions" \
+      --receipt-dir "$home" --dry-run
+  assert_absent "$home/vp-receiptguard.receipt" "the home root is refused too"
+
+  # 3. A symlink pointing in. A literal prefix test says this is outside the
+  # home; the physical resolution says otherwise, and the physical answer is the
+  # one the write obeys.
+  receipt_link="$world/looks-outside"
+  ln -s "$home/state/migrations" "$receipt_link"
+  run 2 "--receipt-dir is a symlink into FM_HOME" \
+    env FM_HOME="$home" "$CLI" vp-receiptguard \
+      --repo "$world/repo" --sessions-dir "$world/sessions" \
+      --receipt-dir "$receipt_link" --dry-run
+  assert_contains "$OUT" "resolves inside the live chief home" "a symlinked destination is resolved, not trusted"
+  assert_absent "$home/state/migrations/vp-receiptguard.receipt" "a symlinked destination writes nothing into the home"
+
+  # 4. The default destination: TMPDIR pointing into the home must be refused
+  # before mktemp creates anything there.
+  run 2 "TMPDIR inside FM_HOME with no --receipt-dir" \
+    env FM_HOME="$home" TMPDIR="$home/state" "$CLI" vp-receiptguard \
+      --repo "$world/repo" --sessions-dir "$world/sessions" --dry-run
+  assert_contains "$OUT" "TMPDIR" "the refusal names TMPDIR as the destination it rejected"
+  [ -z "$(find "$home/state" -maxdepth 1 -name 'fm-vp-migrate.*' -print -quit)" ] \
+    || fail "a refused TMPDIR must not leave a temp receipt directory in the chief home"
+
+  # Negative arm: with FM_HOME set, a destination OUTSIDE it still works. Without
+  # this the refusals above would also be satisfied by a guard that refuses
+  # everything.
+  run 0 "--receipt-dir outside FM_HOME while FM_HOME is set" \
+    env FM_HOME="$home" "$CLI" vp-receiptguard \
+      --repo "$world/repo" --sessions-dir "$world/sessions" \
+      --home "$world/homes/vp-receiptguard" \
+      --receipt-dir "$world/receipts" --dry-run --role vp
+  assert_present "$world/receipts/vp-receiptguard.receipt" "a destination outside the chief home is accepted"
+  pass "a receipt destination resolving into the live chief home is refused, named, and writes nothing"
+}
+
 test_arguments_are_validated_before_any_work() {
   local world
   world=$(make_world args)
@@ -266,4 +324,5 @@ test_an_unknown_or_ambiguous_vp_is_refused_not_guessed
 test_execute_is_refused_and_names_what_it_would_do
 test_the_cutover_is_not_implemented_at_all
 test_a_receipt_never_references_a_live_session
+test_a_receipt_destination_inside_the_live_chief_home_is_refused
 test_arguments_are_validated_before_any_work
