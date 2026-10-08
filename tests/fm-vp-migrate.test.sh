@@ -486,6 +486,49 @@ test_a_receipt_destination_inside_the_live_chief_home_is_refused() {
   pass "a receipt destination resolving into the live chief home is refused, named, and writes nothing"
 }
 
+test_the_receipt_guard_uses_the_same_fallback_home_the_gates_do() {
+  local world
+  # With FM_HOME unset the gates below fall back to the repo root as the home:
+  # the backlog query runs with FM_HOME=<repo>, the default secondmate home is
+  # <repo>/secondmates/<vp>, and the registry is read from <repo>/data. A guard
+  # that keyed on FM_HOME alone returned immediately in exactly that case, so a
+  # receipt could land in the directory the same run calls the live home.
+  world=$(make_world guardfallback)
+  mkdir -p "$world/repo/state/migrations"
+  run 2 "--receipt-dir inside the fallback home, FM_HOME unset" \
+    env -u FM_HOME -u FM_DATA_OVERRIDE "$CLI" vp-guardfallback \
+      --repo "$world/repo" --sessions-dir "$world/sessions" \
+      --home "$world/homes/vp-guardfallback" \
+      --receipt-dir "$world/repo/state/migrations" --dry-run
+  assert_contains "$OUT" "resolves inside the live chief home" "the fallback home is guarded too"
+  assert_contains "$OUT" "$world/repo/state/migrations" "the refusal names the resolved path"
+  assert_absent "$world/repo/state/migrations/vp-guardfallback.receipt" \
+    "no receipt may land in the home the gates fall back to"
+
+  # The repo root itself, and the default destination's TMPDIR, are the same
+  # question asked twice more.
+  run 2 "--receipt-dir equal to the fallback home" \
+    env -u FM_HOME -u FM_DATA_OVERRIDE "$CLI" vp-guardfallback \
+      --repo "$world/repo" --sessions-dir "$world/sessions" \
+      --receipt-dir "$world/repo" --dry-run
+  assert_absent "$world/repo/vp-guardfallback.receipt" "the fallback home root is refused too"
+  run 2 "TMPDIR inside the fallback home, FM_HOME unset" \
+    env -u FM_HOME -u FM_DATA_OVERRIDE TMPDIR="$world/repo/state" "$CLI" vp-guardfallback \
+      --repo "$world/repo" --sessions-dir "$world/sessions" --dry-run
+  assert_contains "$OUT" "TMPDIR" "the refusal names TMPDIR as the destination it rejected"
+  [ -z "$(find "$world/repo/state" -maxdepth 1 -name 'fm-vp-migrate.*' -print -quit)" ] \
+    || fail "a refused TMPDIR must not leave a temp receipt directory in the fallback home"
+
+  # Negative arm: with FM_HOME unset, a destination outside the repo still
+  # works, so the arms above are not satisfied by a guard that refuses
+  # everything once FM_HOME is absent.
+  run 0 "--receipt-dir outside the fallback home, FM_HOME unset" \
+    migrate "$world" vp-guardfallback --role vp
+  assert_present "$world/receipts/vp-guardfallback.receipt" \
+    "a destination outside the fallback home is accepted"
+  pass "the receipt guard refuses the fallback home the gates use, not only an explicit FM_HOME"
+}
+
 test_arguments_are_validated_before_any_work() {
   local world
   world=$(make_world args)
@@ -518,4 +561,5 @@ test_backlog_ownership_is_a_field_match_on_active_rows_not_a_substring_count
 test_a_real_zero_passes_while_an_unreadable_or_absent_backlog_does_not
 test_the_machine_handoff_gate_is_tabled_and_never_passes
 test_a_receipt_destination_inside_the_live_chief_home_is_refused
+test_the_receipt_guard_uses_the_same_fallback_home_the_gates_do
 test_arguments_are_validated_before_any_work
