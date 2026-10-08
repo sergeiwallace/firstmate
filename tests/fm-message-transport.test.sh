@@ -86,7 +86,8 @@ test_validate_reports_resolved_fields_and_defaults() {
 
 test_example_config_is_valid() {
   run 0 "the shipped example validates" "$CLI" --config "$ROOT/docs/examples/message-transports.json" --dry-run
-  assert_equals "native -> agent-mail -> fm-send" "$OUT" "example must express the approved chain"
+  assert_equals "native -> buzz -> agent-mail -> fm-send" "$OUT" \
+    "the example must express the fleet's seeded chain, which the harness writes into every chief home"
   pass "docs/examples/message-transports.json is a valid policy"
 }
 

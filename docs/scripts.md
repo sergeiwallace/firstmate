@@ -24,7 +24,7 @@ The shared no-mistakes gate lifecycle boundary is summarized in [architecture.md
 | `fm-update.sh`           | Guarded self-update of firstmate and local or remote secondmate homes, reconciling redundant divergence and classifying every live mate left on the target commit for restart or fallback nudge |
 | `fm-secondmate-restart.sh` | Persist open conversational work, then restart eligible second mates or report the fallback outcome |
 | `fm-secondmate-restart-lib.sh` | Shared second-mate restart capability and persistence-request contract |
-| `fm-message-transport.sh` | Validate the chief-of-staff transport chain a home declares (native primary, any subset of the known fallbacks in any order, or none), answer the next allowed step after one attempt against that chain, compute durable deadlines, and refuse a dispatch that breaks the phrasing discipline |
+| `fm-message-transport.sh` | Validate the chief-of-staff transport chain a home declares (native primary, any subset of the known fallbacks - `buzz`, `agent-mail`, `fm-send` - in any order, or none), answer the next allowed step after one attempt against that chain, probe the Buzz relay's readiness fail-closed without sending anything, compute durable deadlines, and refuse a dispatch that breaks the phrasing discipline |
 | `fm-message-transport-lib.sh` | Single owner of the transport-policy loader, the outcome-class next-step table resolved against the declared chain, and the dispatch phrasing gate |
 | `fm-dispatch-body.py`    | Durable dispatch-body broker: the owning chief's `dispatch-bodies.sqlite3` is the sole authority for a dispatch's operational text; stages one RFC 8785-hashed body before any transport, claims it atomically for exactly one receiver, and NULLs it on injection, terminal outcome or expiry |
 | `fm-receive.sh`          | Recipient claim gate every transport ends in: the first claim for a staged dispatch id receives the body once; every later route, late doorbell, expired or unknown id receives only the stored receipt |
@@ -63,6 +63,7 @@ The shared no-mistakes gate lifecycle boundary is summarized in [architecture.md
 | `fm-subagent-pretool-check.sh` | Primary-home delegation-shape PreToolUse guard (docs/subagent-guard.md) |
 | `fm-supervision-instructions.sh` | Render the session-start primary-harness supervision block or the one-line repair instruction |
 | `fm-home-seed.sh`        | Transactionally provision a local secondmate home and maintain `data/secondmates.md` |
+| `fm-vp-migrate.sh`       | Plan one VP session's migration into a scoped secondmate home and write a per-gate receipt; `--dry-run` touches nothing and never reports a native-dispatch proof it did not observe, and `--execute` is refused because the live cutover is an operator step |
 | `fm-remote-home-seed.sh` | Register and provision a whole secondmate home on an SSH-reachable host              |
 | `fm-remote-readiness-lib.sh` | Shared remote second-mate readiness gate: check and, when needed, repair then re-check through `fm-remote-doctor.sh` |
 | [`fm-project-origin-lib.sh`](../bin/fm-project-origin-lib.sh) | Accepted origin-form owner shared by both remote provisioning boundaries |

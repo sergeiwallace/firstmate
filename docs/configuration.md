@@ -336,16 +336,16 @@ While the file exists, main's lease-checked commands also take the per-task leas
 
 A chief-of-staff home reaches the sessions it coordinates through a chain of transports it declares in `config/message-transports.json`.
 Native `ListAgents`/`SendMessage` is always the primary, because the outcomes the chain reasons about - a held copy, a copy accepted for an offline session, a delivered copy never activated - are native's own.
-Everything after it is declared: `fallbacks` is any subset of the known fallback adapters, Agent Mail and this repo's existing `fm-send.sh` route, in any order, and it may be empty.
+Everything after it is declared: `fallbacks` is any subset of the known fallback adapters - the Buzz relay, Agent Mail and this repo's existing `fm-send.sh` route - in any order, and it may be empty.
 **No fallback adapter is mandatory.** A home with no Agent Mail configured declares `"fallbacks": ["fm-send"]` and the chain works; a home with neither declares `[]` and the chain begins and ends at native.
 The loader still fails closed, naming the field, on anything outside that: an unknown adapter, `native` named as a fallback, a repeated adapter, a missing `fallbacks` key, an unknown key, or a timeout out of range.
-[`docs/examples/message-transports.json`](examples/message-transports.json) is the fleet default, which uses all three:
+[`docs/examples/message-transports.json`](examples/message-transports.json) is the fleet default, which uses every known adapter:
 
 ```json
 {
   "schema_version": 1,
   "primary": "native",
-  "fallbacks": ["agent-mail", "fm-send"],
+  "fallbacks": ["buzz", "agent-mail", "fm-send"],
   "offline_pending_timeout_seconds": 600,
   "native_activation_timeout_seconds": 600
 }
@@ -355,12 +355,12 @@ The loader still fails closed, naming the field, on anything outside that: an un
 | --- | --- |
 | `schema_version` | `1` |
 | `primary` | `"native"` |
-| `fallbacks` | an array of distinct known fallback adapters (`"agent-mail"`, `"fm-send"`) in the order they should be attempted; may be empty; never `"native"` |
+| `fallbacks` | an array of distinct known fallback adapters (`"buzz"`, `"agent-mail"`, `"fm-send"`) in the order they should be attempted; may be empty; never `"native"` |
 | `offline_pending_timeout_seconds` | whole seconds, 60-3600; default 600 when omitted |
 | `native_activation_timeout_seconds` | whole seconds, 60-3600; default 600 when omitted |
 
 Any unknown key, an unknown or repeated adapter, or a timeout that is zero, negative, fractional, or outside the range is refused before dispatch rather than clamped.
-[`bin/fm-message-transport.sh`](../bin/fm-message-transport.sh) is the command-line face of the policy ([`bin/fm-message-transport-lib.sh`](../bin/fm-message-transport-lib.sh) owns it): `--dry-run` validates and prints the declared chain (`native -> agent-mail -> fm-send` for the default, `native` alone for an empty list); `next <transport> <outcome>` answers what the policy allows after one attempt; `deadline` computes the durable accepted-offline or activation deadline once from the acceptance time; `check-dispatch` refuses a bare slash command, an unnamed skill, or a missing acknowledgement line before anything is sent.
+[`bin/fm-message-transport.sh`](../bin/fm-message-transport.sh) is the command-line face of the policy ([`bin/fm-message-transport-lib.sh`](../bin/fm-message-transport-lib.sh) owns it): `--dry-run` validates and prints the declared chain (`native -> buzz -> agent-mail -> fm-send` for the fleet default, `native` alone for an empty list); `next <transport> <outcome>` answers what the policy allows after one attempt; `deadline` computes the durable accepted-offline or activation deadline once from the acceptance time; `check-dispatch` refuses a bare slash command, an unnamed skill, or a missing acknowledgement line before anything is sent.
 Like `fm-send.sh`, the command requires `FM_HOME` (or `FM_CONFIG_OVERRIDE`) to be named rather than guessing a home; `next` reads the config too, because the successor of an adapter is a property of the declared chain.
 
 `next` maps each (adapter, outcome) pair to an outcome class - keep waiting, advance, done, or stop - and resolves that class against the declared chain, so the answer follows the config rather than a fixed successor.
@@ -368,6 +368,40 @@ An outcome that advances names the adapter declared after the one that reported 
 An adapter the chain does not declare is refused rather than answered: with `"fallbacks": ["fm-send"]`, `next agent-mail pending` exits 2 naming the declared chain.
 The two timeouts govern when a native copy that was accepted for an offline session, or delivered but never claimed by the recipient, releases the next declared fallback; a held native copy stays pending until Claude Code's documented terminal hold outcome and never releases a fallback.
 Nothing in this policy sends a message: the native adapter is owned by the coordinating agent, and `fm-send.sh` keeps its own exit and delivery contract unchanged when the chain reaches it.
+
+### The Buzz relay and its fail-closed probe
+
+`buzz` is the cross-machine relay rung. A harness that manages this fork seeds the chain it wants, and the fleet's own seeded order is `native -> buzz -> agent-mail -> fm-send`: Buzz is the primary cross-machine transport with Agent Mail behind it as the fallback, while same-machine delivery still goes native first. Membership in the known-adapter set is a vocabulary check, not an order, so a home may declare `buzz` anywhere in `fallbacks`, or leave it out.
+
+Buzz is the only adapter with a readiness probe, because it is the only one whose availability is a local, checkable fact - an installed executable:
+
+```sh
+fm-message-transport.sh probe buzz      # -> buzz/unconfigured | buzz/configured
+```
+
+The client is named by `<config>/buzz-client`, one line holding a path to an executable, read at call time rather than taken from the environment. The probe **fails closed** in every direction that is not a present, executable client - no file, a blank file, a named path that is absent, a named path that is not executable - and all of them report `buzz/unconfigured`, which the next-step table classifies as `advance`, so the chain moves on to the next declared adapter instead of stalling. `buzz/configured` is a readiness verdict only; it is never a dispatch outcome.
+
+The probe never executes the client, resolves a host, or opens a socket, and it has no `sent` outcome, so it cannot report a delivery it did not observe. Until a Buzz client is installed, nothing writes `buzz-client` and every probe reports `buzz/unconfigured` by construction - which is the intended behaviour, not a defect.
+
+`native`, `agent-mail` and `fm-send` have **no** readiness probe: native readiness is the recipient harness's own `ListAgents` answer, and the other two are policy-only here, reporting availability as a dispatch outcome (`agent-mail/unconfigured`, `fm-send/failed`). `probe` exits 2 naming any of them, so a caller can tell "not ready" from "not answerable".
+
+## VP-to-secondmate migration (bin/fm-vp-migrate.sh)
+
+[`bin/fm-vp-migrate.sh`](../bin/fm-vp-migrate.sh) plans the migration of one existing VP session into a scoped secondmate home and writes a receipt:
+
+```sh
+fm-vp-migrate.sh <vp-name> --repo <path> --dry-run [--home <path>] [--receipt-dir <dir>] [--role <role>]
+```
+
+It records one line per gate - `vp-record`, `repo-scope`, `charter`, `harness-selection`, `beads-ownership`, `home-seed`, `route-register`, `reconcile`, `native-dispatch-proof`, `cutover` - as `pass`, `fail`, or `skipped`, plus the rollback plan. A dry run writes its receipt to a fresh temp directory unless `--receipt-dir` names one, and never into a live chief home.
+
+**A dry run touches nothing.** It reads session records, and only reads them, matching on each record's own `name` field rather than the pid-keyed file name. The three gates that cannot be observed without a live replacement session - `reconcile`, `native-dispatch-proof`, `cutover` - are always recorded as `skipped(dry-run)` and never as `pass`.
+
+Inputs that cannot be measured are recorded as unmeasured rather than fabricated: a Claude Code session record carries no `AI_SESSION_ROLE`, so pass `--role` to carry the role over, and with `bd` off `PATH` the Beads gate records `unmeasured (bd absent)`. Beads is read-only in every branch; nothing writes to any `.beads` store.
+
+On a failed gate the receipt names it, the command exits 1, the old VP stays authoritative, and the failed home is preserved for diagnosis. Nothing is half-seeded: an occupied home path, or an existing directory that is not a firstmate secondmate home, fails at `home-seed` before anything is written.
+
+**The live cutover is an operator step, and `--execute` is refused with status 2.** The cutover would stop the old VP session and launch its replacement; those steps drive live sessions, so they stay with a human. This is an absence rather than a gate - the script invokes no `kill`, `pkill`, `killall` or `tmux`, and `tests/fm-vp-migrate.test.sh` asserts that, because a refusal guarding reachable code would still be one edit away from running it. The refusal prints the five steps it declines to perform. Run `--dry-run`, read the receipt, then perform the cutover by hand.
 
 ### Dispatch-body broker (dispatch-bodies.sqlite3)
 
