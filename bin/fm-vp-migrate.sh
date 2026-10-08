@@ -26,8 +26,8 @@
 #                          that differs from --from-machine makes this a
 #                          cross-machine move, whose prepared/accepted handoff
 #                          protocol is NOT implemented here, so the
-#                          machine-handoff gate records `unimplemented` and
-#                          never `pass`. A machine key is always named, never
+#                          machine-handoff gate FAILS the plan (exit 1) and
+#                          never records `pass`. A machine key is always named, never
 #                          guessed from the host, matching bin/fm-vp-owner.py's
 #                          required --local-machine-key.
 #   --help
@@ -81,9 +81,10 @@
 # never as pass. A receipt that claimed a native-dispatch proof nobody observed
 # is the one output that would make this tool dangerous. machine-handoff is
 # recorded `skipped (not applicable: same-machine migration)` for a same-machine
-# move and `skipped (unimplemented: cross-machine handoff protocol, gated)` when
-# --to-machine names a different machine: the protocol has no implementation
-# here, and a pass is the one thing it must never report.
+# move, and FAILS the run when --to-machine names a different machine: the
+# protocol it requires has no implementation here, so the plan is incomplete
+# rather than complete-with-a-skip, and a pass is the one thing it must never
+# report.
 #
 # Exit codes: 0 the plan is complete and every reached gate passed; 1 a gate
 # failed (named in the receipt); 2 bad arguments, or --execute.
@@ -615,10 +616,18 @@ record native-dispatch-proof "skipped(dry-run)" "requires a live replacement ses
 # bin/fm-vp-owner.py's required --local-machine-key: a planner that guessed
 # "this machine" would call a cross-machine migration same-machine whenever the
 # guess was wrong, which is the direction that skips the protocol.
+#
+# A cross-machine move FAILS the gate rather than recording a skip and exiting
+# 0. The handoff protocol is REQUIRED for that move, so a plan that cannot
+# evaluate it is not a complete plan: `skipped` plus `result: plan complete`
+# plus exit 0 told an operator the cross-machine migration was planned end to
+# end, when the one requirement specific to it had no implementation at all. A
+# required gate nobody implemented is a failure, and the receipt says which.
 if [ -z "$TO_MACHINE" ] || [ "$TO_MACHINE" = "$FROM_MACHINE" ]; then
   record machine-handoff skipped "not applicable: same-machine migration"
 else
-  record machine-handoff skipped "unimplemented: cross-machine handoff protocol, gated"
+  fail_gate machine-handoff "unimplemented: cross-machine handoff protocol is gated; see design T-3.1"
+  finish
 fi
 
 record cutover "skipped(dry-run)" "operator step: stop $VP, make the replacement authoritative, retire the old authority record"

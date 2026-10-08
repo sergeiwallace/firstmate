@@ -391,28 +391,41 @@ test_the_machine_handoff_gate_is_tabled_and_never_passes() {
     "one machine named twice is a same-machine move"
 
   # A cross-machine move needs the prepared/accepted handoff protocol, which is
-  # not implemented here. Recording it unimplemented is the only honest answer:
-  # a pass would assert agreement between a destination-bound epoch and an
-  # acceptance receipt that nobody produced.
+  # not implemented here, so the plan FAILS at this gate and exits non-zero. A
+  # pass would assert agreement between a destination-bound epoch and an
+  # acceptance receipt that nobody produced; a skip plus exit 0 plus "plan
+  # complete" is the same lie one step quieter - it reports a cross-machine
+  # migration as fully planned when its one cross-machine requirement has no
+  # implementation.
   world=$(make_world handoffcross)
-  run 0 "cross-machine move" migrate "$world" vp-handoffcross --role vp \
+  run 1 "cross-machine move" migrate "$world" vp-handoffcross --role vp \
     --from-machine box-a --to-machine box-b
   receipt="$world/receipts/vp-handoffcross.receipt"
-  assert_grep "gate: machine-handoff: skipped (unimplemented: cross-machine handoff protocol, gated)" "$receipt" \
-    "a cross-machine move records the handoff protocol as unimplemented"
+  assert_grep "gate: machine-handoff: fail (unimplemented: cross-machine handoff protocol is gated; see design T-3.1)" "$receipt" \
+    "a cross-machine move fails on the unimplemented handoff protocol"
+  assert_grep "result: FAILED at gate machine-handoff" "$receipt" \
+    "a required gate nobody implemented is not a complete plan"
+  assert_no_grep "result: plan complete" "$receipt" \
+    "a cross-machine plan must never read as complete"
+  assert_grep "gate: cutover: skipped (blocked by machine-handoff)" "$receipt" \
+    "the gates after the failure are tabled as blocked"
+  assert_equals "$ALL_GATES" "$(receipt_gates "$receipt")" \
+    "the failed cross-machine run still tables the full fixed gate set, in order"
+  assert_contains "$OUT" "failed at gate machine-handoff" "the command names the failed gate on stderr"
   assert_no_grep "gate: machine-handoff: pass" "$receipt" \
     "the handoff gate must never report a pass"
+  assert_absent "$world/homes/vp-handoffcross" "a failed cross-machine plan seeds nothing"
 
   # --to-machine alone, with no source named, is a cross-machine move: a
   # planner that treated an unnamed source as 'this machine' would call it
   # same-machine and skip the protocol.
   world=$(make_world handoffto)
-  run 0 "--to-machine with no --from-machine" migrate "$world" vp-handoffto --role vp \
+  run 1 "--to-machine with no --from-machine" migrate "$world" vp-handoffto --role vp \
     --to-machine box-b
   receipt="$world/receipts/vp-handoffto.receipt"
-  assert_grep "gate: machine-handoff: skipped (unimplemented" "$receipt" \
+  assert_grep "gate: machine-handoff: fail (unimplemented" "$receipt" \
     "naming only a destination machine is a cross-machine move"
-  pass "the machine-handoff requirement is always tabled, as not-applicable or unimplemented, never a pass"
+  pass "the machine-handoff requirement is always tabled: not-applicable, or a failure, never a pass"
 }
 
 test_a_receipt_destination_inside_the_live_chief_home_is_refused() {
