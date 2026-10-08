@@ -60,7 +60,7 @@ BUSY_TIMEOUT_MS = 5000
 # The known-route vocabulary a winner_route may name, not a dispatch chain: which
 # of these a chief actually attempts, and in what order, is declared per home in
 # config/message-transports.json, so the broker accepts any known route.
-ROUTES = ("native", "agent-mail", "fm-send")
+ROUTES = ("native", "buzz", "agent-mail", "fm-send")
 STATES = ("staged", "claimed", "reconcile-required", "injected", "terminal", "expired")
 RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 IDENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")

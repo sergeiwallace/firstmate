@@ -10,7 +10,8 @@
 #      ListAgents/SendMessage is always the primary (its outcomes - held,
 #      accepted-offline, activation - are native-specific, so the native-first
 #      principle is not configurable), and `fallbacks` is any subset of the
-#      known fallback adapters - Agent Mail and the existing fm-send.sh route -
+#      known fallback adapters - the Buzz relay, Agent Mail and the existing
+#      fm-send.sh route -
 #      in any order, INCLUDING NONE. No fallback adapter is mandatory, so a home
 #      with no Agent Mail configured declares a valid chain by leaving it out.
 #      The loader still FAILS CLOSED, naming the invalid field, on anything
@@ -54,7 +55,7 @@ FM_MT_SCHEMA_VERSION=1
 FM_MT_APPROVED_PRIMARY=native
 # The known fallback adapters. Membership is a vocabulary check, not an order:
 # a config may declare any subset of these, in any order, or none at all.
-FM_MT_KNOWN_FALLBACKS="agent-mail fm-send"
+FM_MT_KNOWN_FALLBACKS="buzz agent-mail fm-send"
 FM_MT_TIMEOUT_MIN=60
 FM_MT_TIMEOUT_MAX=3600
 FM_MT_TIMEOUT_DEFAULT=600
@@ -224,6 +225,16 @@ fm_mt_classify() {
     native/unresolved|native/refused|native/denied|native/expired) FM_MT_CLASS=advance ;;
     native/claimed) FM_MT_CLASS=done ;;
     native/ambiguous) FM_MT_CLASS=stop; FM_MT_DETAIL=reconcile ;;
+    # Buzz mirrors Agent Mail's outcome vocabulary exactly: it is a store-and-
+    # forward relay with the same four dispositions, so it needs no row Agent
+    # Mail does not have (notably no `sent`, which only the fire-and-forget
+    # fm-send route reports). `unconfigured` is what the fail-closed probe
+    # reports while no Buzz client is installed, so an unconfigured relay
+    # advances to the next declared adapter instead of stalling the chain.
+    buzz/unconfigured|buzz/cancelled|buzz/expired) FM_MT_CLASS=advance ;;
+    buzz/pending) FM_MT_CLASS=pending; FM_MT_DETAIL=buzz ;;
+    buzz/receipt|buzz/claimed) FM_MT_CLASS=done ;;
+    buzz/ambiguous) FM_MT_CLASS=stop; FM_MT_DETAIL=reconcile ;;
     agent-mail/unconfigured|agent-mail/cancelled|agent-mail/expired) FM_MT_CLASS=advance ;;
     agent-mail/pending) FM_MT_CLASS=pending; FM_MT_DETAIL=agent-mail ;;
     agent-mail/receipt|agent-mail/claimed) FM_MT_CLASS=done ;;
@@ -246,7 +257,7 @@ fm_mt_classify() {
 # (primary first, then the fallbacks in declared order). Requires a successful
 # fm_mt_load, because a successor is a property of that chain. Tokens:
 #   pending:<what>            keep waiting; no fallback (held, native-offline,
-#                             native-activation, agent-mail)
+#                             native-activation, buzz, agent-mail)
 #   fallback:<next>[:<record>] attempt <next>, the adapter declared after this
 #                             one, with the SAME dispatch id, after recording
 #                             <record> when present

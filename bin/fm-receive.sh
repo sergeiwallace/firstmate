@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fm-receive.sh - the recipient's claim gate for a chief-of-staff dispatch.
 #
-# Usage: fm-receive.sh [--db <path>] --dispatch-id <id> --vp-id <vp-id> --route native|agent-mail|fm-send
+# Usage: fm-receive.sh [--db <path>] --dispatch-id <id> --vp-id <vp-id> --route native|buzz|agent-mail|fm-send
 #                      [--expected-hash <sha256-hex>] [--now <rfc3339>]
 #        fm-receive.sh --help
 #
@@ -62,7 +62,7 @@ done
 
 [ -n "$DISPATCH_ID" ] || refuse 2 "--dispatch-id is required; a receive without an id has nothing to claim"
 [ -n "$VP_ID" ] || refuse 2 "--vp-id is required; the gate returns a body only to its addressed VP"
-[ -n "$ROUTE" ] || refuse 2 "--route is required (native, agent-mail, or fm-send) so the winning route is recorded"
+[ -n "$ROUTE" ] || refuse 2 "--route is required (native, buzz, agent-mail, or fm-send) so the winning route is recorded"
 
 if [ -z "$DB" ]; then
   if [ -n "${FM_HOME:-}" ]; then
