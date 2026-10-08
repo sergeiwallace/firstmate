@@ -316,6 +316,80 @@ fm_mt_next() {
   esac
 }
 
+# fm_mt_probe <transport>
+# Print "<transport>/<outcome>" for one adapter's READINESS, without sending
+# anything. Only `buzz` has a probe in this fork; see the note below on why
+# Agent Mail has none.
+#
+# The buzz probe is a pure file read. The Buzz client is named by
+# <config>/buzz-client - one line holding the path to an executable - because a
+# transport's location must be a config file read at call time, not an
+# environment variable frozen when a session launched. It FAILS CLOSED in every
+# direction that is not a present, executable client:
+#
+#   no buzz-client file            -> buzz/unconfigured
+#   blank buzz-client file         -> buzz/unconfigured
+#   named path absent              -> buzz/unconfigured
+#   named path not executable      -> buzz/unconfigured
+#   named path executable          -> buzz/configured
+#
+# and `buzz/unconfigured` classifies as `advance`, so a home with no Buzz client
+# routes straight on to the next declared adapter rather than stalling. This is
+# the state the whole fleet is in today: the harness-side Buzz client (AIH-zwr6m)
+# has not landed, so nothing writes buzz-client yet and every probe here reports
+# unconfigured by construction.
+#
+# It NEVER executes the client, resolves a host, or opens a socket. A probe that
+# shelled out would turn a readiness question into a send, and a probe that
+# reported anything optimistic on a failed read would let the chain claim a
+# delivery nobody made. `configured` is a readiness verdict only: it is not a
+# dispatch outcome and is never fed to fm_mt_next.
+#
+# Returns 2 with FM_MT_ERROR for an adapter this fork cannot probe, so a caller
+# can tell "not ready" (a printed outcome) from "not answerable" (a refusal)
+# instead of reading one as the other.
+fm_mt_probe() {
+  local transport=$1 dir client
+  FM_MT_ERROR=
+  case "$transport" in
+    buzz) ;;
+    native|agent-mail|fm-send)
+      # Deliberate, not an oversight: native readiness is the recipient
+      # harness's own ListAgents answer (not a shell question at all), and
+      # Agent Mail and fm-send are policy-only in this fork - their
+      # availability is reported by the dispatching agent as an OUTCOME
+      # (agent-mail/unconfigured, fm-send/failed), never probed here. Buzz
+      # needs a probe because its client is an installed executable whose
+      # absence is a local, checkable fact.
+      FM_MT_ERROR="transport: '$transport' has no readiness probe in this fork; its availability is reported as a dispatch outcome"
+      return 2
+      ;;
+    *)
+      FM_MT_ERROR="transport: '$transport' is not one of ${FM_MT_APPROVED_PRIMARY}, ${FM_MT_KNOWN_FALLBACKS// /, }"
+      return 2
+      ;;
+  esac
+  if [ -n "${FM_CONFIG_OVERRIDE:-}" ]; then
+    dir=$FM_CONFIG_OVERRIDE
+  elif [ -n "${FM_HOME:-}" ]; then
+    dir=$FM_HOME/config
+  else
+    FM_MT_ERROR="FM_HOME is unset and FM_CONFIG_OVERRIDE is unset: name the operational home before probing a transport"
+    return 2
+  fi
+  if [ ! -f "$dir/buzz-client" ] || [ ! -r "$dir/buzz-client" ]; then
+    printf 'buzz/unconfigured\n'
+    return 0
+  fi
+  # First non-blank line, trimmed; a blank or whitespace-only file is unconfigured.
+  client=$(sed -n '/[^[:space:]]/{s/^[[:space:]]*//;s/[[:space:]]*$//;p;q;}' "$dir/buzz-client" 2>/dev/null) || client=
+  if [ -z "$client" ] || [ ! -x "$client" ]; then
+    printf 'buzz/unconfigured\n'
+    return 0
+  fi
+  printf 'buzz/configured\n'
+}
+
 # fm_mt_deadline <accepted-epoch-seconds> <timeout-seconds>
 # Print the durable deadline for an accepted-offline or delivered native copy.
 # Computed once from the acceptance timestamp; a restart re-reads the stored
