@@ -21,6 +21,15 @@
 #   --role <role>          the VP's AI_SESSION_ROLE, which a Claude Code session
 #                          record does not carry; without it that gate records
 #                          `unmeasured` rather than inventing a value
+#   --from-machine <key>   the machine key the VP is owned by now (optional)
+#   --to-machine <key>     the machine key the VP would move to. Naming a key
+#                          that differs from --from-machine makes this a
+#                          cross-machine move, whose prepared/accepted handoff
+#                          protocol is NOT implemented here, so the
+#                          machine-handoff gate records `unimplemented` and
+#                          never `pass`. A machine key is always named, never
+#                          guessed from the host, matching bin/fm-vp-owner.py's
+#                          required --local-machine-key.
 #   --help
 #
 # WHAT THIS DOES NOT DO, BY CONSTRUCTION
@@ -35,9 +44,16 @@
 # names what it would do, so there is no code path here that could perform it.
 #
 # T-3.1's gates, in order. A dry run plans each one and records
-# pass | fail | skipped(dry-run) | skipped(unmeasured: <why>); the first failure
+# pass | fail | skipped(dry-run) | skipped (unmeasured: <why>); the first failure
 # stops the run, is named in the receipt, and exits non-zero with the old VP
 # still authoritative and nothing seeded.
+#
+# The receipt ALWAYS lists the full, fixed gate set below, whatever happened:
+# every gate after a failure is recorded `skipped (blocked by <failed-gate>)`
+# rather than omitted. An omitted gate and a gate nobody has implemented read
+# identically in a receipt, so a short receipt could not be told apart from a
+# complete one with gates missing - and T-3.1 asks for the gate table, not for
+# the prefix of it that ran.
 #
 #   vp-record              the named VP has exactly one readable session record
 #   repo-scope             --repo is preserved: it contains the VP's own cwd
@@ -49,12 +65,20 @@
 #   route-register         the resulting registry bindings validate
 #   reconcile              the replacement would reconcile its books
 #   native-dispatch-proof  one native SendMessage/ack/notify_when_idle cycle
+#   machine-handoff        a cross-machine move uses the prepared/accepted
+#                          handoff protocol and retires nothing until the
+#                          destination-bound next epoch and the acceptance
+#                          receipt agree (AIH-62xkr)
 #   cutover                retire the old VP and make the replacement authoritative
 #
-# The last three cannot be proved without starting a session, so under --dry-run
-# they are always recorded as skipped(dry-run) and never as pass. A receipt that
-# claimed a native-dispatch proof nobody observed is the one output that would
-# make this tool dangerous.
+# reconcile, native-dispatch-proof and cutover cannot be proved without starting
+# a session, so under --dry-run they are always recorded as skipped(dry-run) and
+# never as pass. A receipt that claimed a native-dispatch proof nobody observed
+# is the one output that would make this tool dangerous. machine-handoff is
+# recorded `skipped (not applicable: same-machine migration)` for a same-machine
+# move and `skipped (unimplemented: cross-machine handoff protocol, gated)` when
+# --to-machine names a different machine: the protocol has no implementation
+# here, and a pass is the one thing it must never report.
 #
 # Exit codes: 0 the plan is complete and every reached gate passed; 1 a gate
 # failed (named in the receipt); 2 bad arguments, or --execute.
@@ -136,6 +160,8 @@ HOME_DIR=
 RECEIPT_DIR=
 SESSIONS_DIR=
 ROLE=
+FROM_MACHINE=
+TO_MACHINE=
 MODE=
 
 while [ $# -gt 0 ]; do
@@ -145,6 +171,8 @@ while [ $# -gt 0 ]; do
     --receipt-dir) [ $# -ge 2 ] || refuse 2 "--receipt-dir requires a path"; RECEIPT_DIR=$2; shift 2 ;;
     --sessions-dir) [ $# -ge 2 ] || refuse 2 "--sessions-dir requires a path"; SESSIONS_DIR=$2; shift 2 ;;
     --role) [ $# -ge 2 ] || refuse 2 "--role requires a value"; ROLE=$2; shift 2 ;;
+    --from-machine) [ $# -ge 2 ] || refuse 2 "--from-machine requires a machine key"; FROM_MACHINE=$2; shift 2 ;;
+    --to-machine) [ $# -ge 2 ] || refuse 2 "--to-machine requires a machine key"; TO_MACHINE=$2; shift 2 ;;
     --dry-run)
       [ -z "$MODE" ] || refuse 2 "name one of --dry-run or --execute, not both"
       MODE=dry-run
@@ -217,6 +245,12 @@ RECEIPT_DIR=$(physical_path "$RECEIPT_DIR") \
 refuse_inside_chief_home "the resolved receipt directory" "$RECEIPT_DIR"
 RECEIPT="$RECEIPT_DIR/$VP.receipt"
 
+# The fixed gate set T-3.1 asks the receipt to table, in the order the gates
+# run. This is the authority for what a receipt must list: finish() fills in
+# every entry no gate reached, so the receipt's gate list is this list whether
+# the plan completed or stopped at its first failure.
+ALL_GATES='vp-record repo-scope charter harness-selection beads-ownership home-seed route-register reconcile native-dispatch-proof machine-handoff cutover'
+
 GATE_LINES=
 FAILED_GATE=
 record() {  # <gate> <status> [detail]
@@ -231,6 +265,23 @@ record() {  # <gate> <status> [detail]
 fail_gate() {  # <gate> <detail>
   FAILED_GATE=$1
   record "$1" fail "$2"
+}
+
+gate_recorded() {  # <gate>
+  case $'\n'"$GATE_LINES" in
+    *$'\n'"gate: $1: "*) return 0 ;;
+  esac
+  return 1
+}
+
+# Every gate the run never reached is recorded as blocked by the one that
+# failed, so the receipt tables the whole fixed gate set rather than the prefix
+# that ran. An omitted gate reads exactly like a gate nobody implemented.
+record_blocked_gates() {
+  local gate
+  for gate in $ALL_GATES; do
+    gate_recorded "$gate" || record "$gate" skipped "blocked by $FAILED_GATE"
+  done
 }
 
 write_receipt() {
@@ -256,6 +307,7 @@ write_receipt() {
 }
 
 finish() {
+  [ -z "$FAILED_GATE" ] || record_blocked_gates
   write_receipt
   printf 'receipt: %s\n' "$RECEIPT"
   if [ -n "$FAILED_GATE" ]; then
@@ -436,6 +488,27 @@ fi
 # --- the three gates a dry run cannot reach -----------------------------------
 record reconcile "skipped(dry-run)" "would run fm-secondmate-reconcile.sh against the replacement's home"
 record native-dispatch-proof "skipped(dry-run)" "requires a live replacement session; never recorded as pass by a dry run"
+
+# --- gate: machine-handoff ----------------------------------------------------
+#
+# AIH-62xkr: when a VP moves to another machine the system shall use the
+# prepared/accepted handoff protocol, and shall start no destination VP and
+# retire no source authority record until the destination-bound next epoch and
+# the acceptance receipt agree. A same-machine move does not invoke it. A
+# cross-machine one does, and there is no implementation of it here, so this
+# gate records `unimplemented` - not `pass`, and not nothing, because a gate
+# absent from the receipt reads exactly like a gate that passed silently.
+#
+# The machine key is named, never inferred from the host, matching
+# bin/fm-vp-owner.py's required --local-machine-key: a planner that guessed
+# "this machine" would call a cross-machine migration same-machine whenever the
+# guess was wrong, which is the direction that skips the protocol.
+if [ -z "$TO_MACHINE" ] || [ "$TO_MACHINE" = "$FROM_MACHINE" ]; then
+  record machine-handoff skipped "not applicable: same-machine migration"
+else
+  record machine-handoff skipped "unimplemented: cross-machine handoff protocol, gated"
+fi
+
 record cutover "skipped(dry-run)" "operator step: stop $VP, make the replacement authoritative, retire the old authority record"
 
 finish
