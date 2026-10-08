@@ -256,6 +256,122 @@ test_a_receipt_never_references_a_live_session() {
   pass "a fixture dry-run receipt references no live session or live sessions directory"
 }
 
+# tasks_axi_shim <world> <<'JSON' ... JSON
+# A fixture `tasks-axi` on PATH that prints the given canned body for
+# `list --json` and nothing else. tasks-axi is not installed on this host, and
+# installing a binary to test a parser would be the wrong trade: what the gate
+# must get right is how it reads the rows, not how they were produced. Echoes
+# the directory to prepend to PATH.
+tasks_axi_shim() {  # <world> [exit-status]  (body on stdin)
+  local world=$1 status=${2:-0} dir="$1/shim"
+  mkdir -p "$dir" "$world/repo/data"
+  cat > "$dir/payload.json"
+  cat > "$dir/tasks-axi" <<SHIM
+#!/usr/bin/env bash
+# Fixture. Answers list --json only; every other invocation is a refusal, so a
+# gate that fell back to a different command would not quietly pass.
+case "\$*" in
+  'list --json') cat "$dir/payload.json"; exit $status ;;
+  *) printf 'fixture tasks-axi: unexpected invocation: %s\n' "\$*" >&2; exit 64 ;;
+esac
+SHIM
+  chmod +x "$dir/tasks-axi"
+  printf '%s\n' "$dir"
+}
+
+# migrate_with_shim <shim-dir> <world> <vp> [extra args...]: migrate() with the
+# fixture tasks-axi ahead of PATH. A subshell, because `env` cannot invoke a
+# shell function and a bare assignment prefix on one would leak into the suite.
+migrate_with_shim() {
+  local shim=$1
+  shift
+  ( PATH="$shim:$PATH"; migrate "$@" )
+}
+
+test_backlog_ownership_is_a_field_match_on_active_rows_not_a_substring_count() {
+  local world receipt shim
+  world=$(make_world ownactive)
+  # Two rows genuinely belong to vp-ownactive: one by its owner field, one by a
+  # whole-token mention in the title. Three decoys exercise exactly what the old
+  # `grep -c -- "$VP"` counted and the gate must not: a finished row owned by
+  # the VP, a longer name the VP name is a prefix of, and a prose mention in an
+  # unrelated active row's title that does not name the VP as a token.
+  shim=$(tasks_axi_shim "$world" <<'JSON'
+{"tasks": [
+  {"id": "t-1", "state": "in_flight", "owner": "vp-ownactive", "title": "live work"},
+  {"id": "t-2", "state": "Queued", "owner": "someone-else", "title": "hand off to vp-ownactive"},
+  {"id": "t-3", "state": "Done", "owner": "vp-ownactive", "title": "finished work"},
+  {"id": "t-4", "state": "in_flight", "owner": "vp-ownactive-deputy", "title": "a different owner"},
+  {"id": "t-5", "state": "queued", "owner": "nobody", "title": "see vp-ownactive-deputy/notes"}
+]}
+JSON
+  )
+  run 0 "field-matched ownership" migrate_with_shim "$shim" "$world" vp-ownactive --role vp
+  receipt="$world/receipts/vp-ownactive.receipt"
+  assert_grep "gate: beads-ownership: pass (2 of 4 active row(s) name vp-ownactive by field match [owner=1 id=0 text=1]" "$receipt" \
+    "only active rows naming the VP in a named field are counted"
+  assert_grep "list --json" "$receipt" "the receipt names the structured query it ran"
+  pass "backlog ownership counts active rows by field match, not substrings of arbitrary text"
+}
+
+test_a_real_zero_passes_while_an_unreadable_or_absent_backlog_does_not() {
+  local world receipt shim
+  # 1. A query that succeeded and found no active work is a pass, and says so.
+  world=$(make_world ownzero)
+  shim=$(tasks_axi_shim "$world" <<'JSON'
+{"tasks": [{"id": "t-1", "state": "Done", "owner": "vp-ownzero", "title": "finished"}]}
+JSON
+  )
+  run 0 "no active rows" migrate_with_shim "$shim" "$world" vp-ownzero --role vp
+  receipt="$world/receipts/vp-ownzero.receipt"
+  assert_grep "gate: beads-ownership: pass (0 active rows" "$receipt" \
+    "a query that succeeded with no active work is a real zero"
+
+  # 2. A shape nobody can parse is a failure, never a pass: an unreadable
+  # listing is unknown ownership, not absent ownership.
+  world=$(make_world ownjunk)
+  shim=$(tasks_axi_shim "$world" <<'JSON'
+this is not json
+JSON
+  )
+  run 1 "unparseable listing" migrate_with_shim "$shim" "$world" vp-ownjunk --role vp
+  receipt="$world/receipts/vp-ownjunk.receipt"
+  assert_grep "gate: beads-ownership: fail" "$receipt" "an unparseable listing fails the gate"
+  assert_grep "cannot read" "$receipt" "the receipt says the shape could not be read"
+  assert_no_grep "gate: beads-ownership: pass" "$receipt" "an unreadable listing must never pass"
+  assert_grep "result: FAILED at gate beads-ownership" "$receipt" "the run stops at the gate it could not measure"
+  assert_grep "gate: home-seed: skipped (blocked by beads-ownership)" "$receipt" \
+    "the later gates are still tabled, as blocked"
+
+  # 3. Valid JSON of the wrong shape is a failure too: a gate that shrugged at
+  # an object it did not recognise would report zero owned work for every
+  # future schema change.
+  world=$(make_world ownshape)
+  shim=$(tasks_axi_shim "$world" <<'JSON'
+{"schema": 9, "payload": {"things": 3}}
+JSON
+  )
+  run 1 "valid JSON, unrecognised shape" migrate_with_shim "$shim" "$world" vp-ownshape --role vp
+  receipt="$world/receipts/vp-ownshape.receipt"
+  assert_grep "gate: beads-ownership: fail" "$receipt" "an unrecognised shape fails rather than counting zero"
+  assert_grep "no row list found" "$receipt" "the receipt names what it could not find"
+
+  # 4. A wrapper that failed is unmeasured, not a pass and not a failure: on a
+  # host with no tasks-axi there is nothing to read, and an empty - therefore
+  # falsely reassuring - ownership set is the one answer this must never give.
+  world=$(make_world ownfail)
+  shim=$(tasks_axi_shim "$world" 7 <<'JSON'
+{"tasks": []}
+JSON
+  )
+  run 0 "wrapper exits non-zero" migrate_with_shim "$shim" "$world" vp-ownfail --role vp
+  receipt="$world/receipts/vp-ownfail.receipt"
+  assert_grep "gate: beads-ownership: skipped (unmeasured:" "$receipt" \
+    "a failed wrapper is unmeasured"
+  assert_no_grep "gate: beads-ownership: pass" "$receipt" "a failed wrapper must not read as a pass"
+  pass "a real zero passes; an unreadable shape fails; an unavailable wrapper is unmeasured"
+}
+
 test_the_machine_handoff_gate_is_tabled_and_never_passes() {
   local world receipt
   # A same-machine move does not invoke the handoff protocol, and says so
@@ -385,6 +501,8 @@ test_an_unknown_or_ambiguous_vp_is_refused_not_guessed
 test_execute_is_refused_and_names_what_it_would_do
 test_the_cutover_is_not_implemented_at_all
 test_a_receipt_never_references_a_live_session
+test_backlog_ownership_is_a_field_match_on_active_rows_not_a_substring_count
+test_a_real_zero_passes_while_an_unreadable_or_absent_backlog_does_not
 test_the_machine_handoff_gate_is_tabled_and_never_passes
 test_a_receipt_destination_inside_the_live_chief_home_is_refused
 test_arguments_are_validated_before_any_work
