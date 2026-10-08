@@ -41,7 +41,8 @@
 #   repo-scope             --repo is preserved: it contains the VP's own cwd
 #   charter                a charter brief is resolvable for the new home
 #   harness-selection      the harness family (and role, when supplied) carried over
-#   beads-ownership        the VP's in-progress/blocked Beads work, read-only
+#   beads-ownership        the VP's in-progress/blocked backlog work, read-only,
+#                          through bin/fm-tasks-axi.sh (never a bare backend CLI)
 #   home-seed              a scoped home + route can be seeded (fm-home-seed.sh)
 #   route-register         the resulting registry bindings validate
 #   reconcile              the replacement would reconcile its books
@@ -295,31 +296,19 @@ fi
 
 # --- gate: beads-ownership ----------------------------------------------------
 #
-# Read-only in every branch. Nothing here writes to any .beads store, and an
-# absent bd is recorded as unmeasured rather than as an empty - and therefore
-# falsely reassuring - ownership set.
-if command -v bd >/dev/null 2>&1; then
-  BD_OUT=$(cd "$repo_abs" && bd list --json --assignee "$VP" --limit 0 2>/dev/null) || BD_OUT=
-  if [ -n "$BD_OUT" ]; then
-    BD_COUNT=$(printf '%s' "$BD_OUT" | python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    print("unparseable"); raise SystemExit(0)
-rows = data.get("issues", data) if isinstance(data, dict) else data
-print(len(rows) if isinstance(rows, list) else "unparseable")
-' 2>/dev/null) || BD_COUNT=unparseable
-    if [ "$BD_COUNT" = unparseable ]; then
-      record beads-ownership skipped "unmeasured: bd returned output this script could not parse"
-    else
-      record beads-ownership pass "$BD_COUNT issue(s) assigned to $VP in $repo_abs (read-only)"
-    fi
-  else
-    record beads-ownership skipped "unmeasured: bd is present but returned nothing for $repo_abs"
-  fi
+# Read-only in every branch, and read through the home's own tasks-axi wrapper
+# rather than a bare backend CLI. The wrapper owns backlog addressing and
+# backend resolution, so going around it would read a different queue than the
+# lifecycle transitions do - which is exactly what fm-lint.sh's backend-purity
+# check refuses. The cost is that an absent tasks-axi makes this gate
+# unmeasurable, and an unmeasurable gate is recorded as such: an empty - and
+# therefore falsely reassuring - ownership set is never reported as a pass.
+BACKLOG_OUT=$(FM_HOME="${FM_HOME:-$repo_abs}" "$SCRIPT_DIR/fm-tasks-axi.sh" list 2>&1) || BACKLOG_OUT=
+if [ -z "$BACKLOG_OUT" ]; then
+  record beads-ownership skipped "unmeasured: the tasks-axi wrapper returned nothing for $repo_abs (tasks-axi absent, or no backlog resolved)"
 else
-  record beads-ownership skipped "unmeasured (bd absent)"
+  OWNED=$(printf '%s\n' "$BACKLOG_OUT" | grep -c -- "$VP") || OWNED=0
+  record beads-ownership pass "$OWNED backlog row(s) mentioning $VP in $repo_abs (read-only, via fm-tasks-axi.sh)"
 fi
 
 # --- gate: home-seed ----------------------------------------------------------
