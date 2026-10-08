@@ -63,7 +63,15 @@ migrate() {  # <world> <vp> [extra args...]
     --dry-run "$@"
 }
 
-ALL_GATES="vp-record repo-scope charter harness-selection beads-ownership home-seed route-register reconcile native-dispatch-proof cutover"
+ALL_GATES="vp-record repo-scope charter harness-selection beads-ownership home-seed route-register reconcile native-dispatch-proof machine-handoff cutover"
+
+# receipt_gates <receipt>: the gate names the receipt tables, in order. Used to
+# compare the receipt's gate SET against ALL_GATES rather than only checking
+# that each expected gate is present: a receipt may not quietly grow or drop a
+# gate either.
+receipt_gates() {
+  sed -n 's/^gate: \([^:]*\):.*/\1/p' "$1" | tr '\n' ' ' | sed 's/ $//'
+}
 
 test_dry_run_happy_path_records_every_gate_and_touches_nothing() {
   local world receipt gate
@@ -75,6 +83,8 @@ test_dry_run_happy_path_records_every_gate_and_touches_nothing() {
   for gate in $ALL_GATES; do
     assert_grep "gate: $gate:" "$receipt" "the receipt must record the $gate gate"
   done
+  assert_equals "$ALL_GATES" "$(receipt_gates "$receipt")" \
+    "the receipt tables exactly the fixed gate set, in order"
   assert_grep "result: plan complete; no gate failed" "$receipt" "a clean plan says so"
   assert_grep "mode: dry-run" "$receipt" "the receipt records its mode"
   # Nothing seeded, nothing started.
@@ -154,8 +164,16 @@ test_a_failed_seed_names_the_gate_and_leaves_no_half_seeded_home() {
   # The blocker is untouched and no home was created around it.
   assert_equals "not a home" "$(cat "$blocker")" "the occupying file must not be overwritten"
   [ ! -d "$blocker" ] || fail "no directory may be created at the occupied home path"
-  # The gates after the failure are not reported at all, rather than as passes.
-  assert_no_grep "gate: native-dispatch-proof:" "$receipt" "gates after a failure are not reached"
+  # The gates after the failure are tabled as blocked, never as passes and
+  # never omitted: a receipt missing a gate cannot be told apart from one whose
+  # gate passed silently, and T-3.1 asks for the whole gate table.
+  assert_equals "$ALL_GATES" "$(receipt_gates "$receipt")" \
+    "a failed run still tables the full fixed gate set, in order"
+  for gate in route-register reconcile native-dispatch-proof machine-handoff cutover; do
+    assert_grep "gate: $gate: skipped (blocked by home-seed)" "$receipt" \
+      "$gate is recorded blocked by the gate that failed"
+    assert_no_grep "gate: $gate: pass" "$receipt" "$gate must never read as a pass after a failure"
+  done
   pass "a failed seed names the gate, preserves the blocker, and leaves no half-seeded home"
 }
 
@@ -236,6 +254,49 @@ test_a_receipt_never_references_a_live_session() {
   # Every path it does name is inside the fixture world.
   assert_grep "$world" "$receipt" "the receipt's paths are fixture paths"
   pass "a fixture dry-run receipt references no live session or live sessions directory"
+}
+
+test_the_machine_handoff_gate_is_tabled_and_never_passes() {
+  local world receipt
+  # A same-machine move does not invoke the handoff protocol, and says so
+  # rather than leaving the requirement off the receipt.
+  world=$(make_world handoffsame)
+  run 0 "same-machine move" migrate "$world" vp-handoffsame --role vp
+  receipt="$world/receipts/vp-handoffsame.receipt"
+  assert_grep "gate: machine-handoff: skipped (not applicable: same-machine migration)" "$receipt" \
+    "a same-machine move records the handoff gate as not applicable"
+
+  # Naming the same key on both sides is still a same-machine move.
+  world=$(make_world handoffsamekey)
+  run 0 "same key both sides" migrate "$world" vp-handoffsamekey --role vp \
+    --from-machine box-a --to-machine box-a
+  receipt="$world/receipts/vp-handoffsamekey.receipt"
+  assert_grep "gate: machine-handoff: skipped (not applicable: same-machine migration)" "$receipt" \
+    "one machine named twice is a same-machine move"
+
+  # A cross-machine move needs the prepared/accepted handoff protocol, which is
+  # not implemented here. Recording it unimplemented is the only honest answer:
+  # a pass would assert agreement between a destination-bound epoch and an
+  # acceptance receipt that nobody produced.
+  world=$(make_world handoffcross)
+  run 0 "cross-machine move" migrate "$world" vp-handoffcross --role vp \
+    --from-machine box-a --to-machine box-b
+  receipt="$world/receipts/vp-handoffcross.receipt"
+  assert_grep "gate: machine-handoff: skipped (unimplemented: cross-machine handoff protocol, gated)" "$receipt" \
+    "a cross-machine move records the handoff protocol as unimplemented"
+  assert_no_grep "gate: machine-handoff: pass" "$receipt" \
+    "the handoff gate must never report a pass"
+
+  # --to-machine alone, with no source named, is a cross-machine move: a
+  # planner that treated an unnamed source as 'this machine' would call it
+  # same-machine and skip the protocol.
+  world=$(make_world handoffto)
+  run 0 "--to-machine with no --from-machine" migrate "$world" vp-handoffto --role vp \
+    --to-machine box-b
+  receipt="$world/receipts/vp-handoffto.receipt"
+  assert_grep "gate: machine-handoff: skipped (unimplemented" "$receipt" \
+    "naming only a destination machine is a cross-machine move"
+  pass "the machine-handoff requirement is always tabled, as not-applicable or unimplemented, never a pass"
 }
 
 test_a_receipt_destination_inside_the_live_chief_home_is_refused() {
@@ -324,5 +385,6 @@ test_an_unknown_or_ambiguous_vp_is_refused_not_guessed
 test_execute_is_refused_and_names_what_it_would_do
 test_the_cutover_is_not_implemented_at_all
 test_a_receipt_never_references_a_live_session
+test_the_machine_handoff_gate_is_tabled_and_never_passes
 test_a_receipt_destination_inside_the_live_chief_home_is_refused
 test_arguments_are_validated_before_any_work
