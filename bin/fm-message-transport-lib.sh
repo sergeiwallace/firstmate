@@ -330,6 +330,7 @@ fm_mt_next() {
 #   no buzz-client file            -> buzz/unconfigured
 #   blank buzz-client file         -> buzz/unconfigured
 #   named path absent              -> buzz/unconfigured
+#   named path is a directory      -> buzz/unconfigured
 #   named path not executable      -> buzz/unconfigured
 #   named path executable          -> buzz/configured
 #
@@ -383,7 +384,7 @@ fm_mt_probe() {
   fi
   # First non-blank line, trimmed; a blank or whitespace-only file is unconfigured.
   client=$(sed -n '/[^[:space:]]/{s/^[[:space:]]*//;s/[[:space:]]*$//;p;q;}' "$dir/buzz-client" 2>/dev/null) || client=
-  if [ -z "$client" ] || [ ! -x "$client" ]; then
+  if [ -z "$client" ] || [ ! -f "$client" ] || [ ! -x "$client" ]; then
     printf 'buzz/unconfigured\n'
     return 0
   fi
