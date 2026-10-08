@@ -203,7 +203,7 @@ test_unknown_transport_or_outcome_is_refused() {
   run 2 "unknown outcome" env FM_HOME="$FLEET_HOME" "$CLI" next native teleported
   assert_contains "$OUT" "not a known native outcome" "unknown outcome is named"
   run 2 "unknown transport" env FM_HOME="$FLEET_HOME" "$CLI" next smoke-signal delivered
-  assert_contains "$OUT" "not one of native, agent-mail, fm-send" "unknown transport is named"
+  assert_contains "$OUT" "not one of native, buzz, agent-mail, fm-send" "unknown transport is named"
   pass "an unknown transport or outcome is refused, never guessed"
 }
 

@@ -6,7 +6,7 @@
 #   validate                     load the policy; print the resolved fields, or the
 #                                invalid field and exit 2 (fail closed before dispatch)
 #   --dry-run | order            validate, then print the declared chain, e.g.
-#                                native -> agent-mail -> fm-send
+#                                native -> buzz -> agent-mail -> fm-send
 #   next <transport> <outcome>   print the next action token for one dispatch attempt,
 #                                resolved against the declared chain, so this command
 #                                loads the config too (see the library header for the
