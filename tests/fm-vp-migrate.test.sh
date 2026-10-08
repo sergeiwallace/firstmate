@@ -288,14 +288,15 @@ migrate_with_shim() {
   ( PATH="$shim:$PATH"; migrate "$@" )
 }
 
-test_backlog_ownership_is_a_field_match_on_active_rows_not_a_substring_count() {
+test_backlog_ownership_counts_only_an_owner_field_equal_to_the_vp() {
   local world receipt shim
   world=$(make_world ownactive)
-  # Two rows genuinely belong to vp-ownactive: one by its owner field, one by a
-  # whole-token mention in the title. Three decoys exercise exactly what the old
-  # `grep -c -- "$VP"` counted and the gate must not: a finished row owned by
-  # the VP, a longer name the VP name is a prefix of, and a prose mention in an
-  # unrelated active row's title that does not name the VP as a token.
+  # Exactly one active row belongs to vp-ownactive: t-1, by its owner field.
+  # The decoys are everything that must NOT count. t-2 is the sharp one: its
+  # title names the VP, but its owner field gives the row to someone else, so
+  # the row is not the VP's - counting it claimed ownership of work another
+  # owner field had explicitly assigned away. t-3 is finished, t-4 is a longer
+  # name the VP name is a prefix of, t-5 is a prose mention of that longer name.
   shim=$(tasks_axi_shim "$world" <<'JSON'
 {"tasks": [
   {"id": "t-1", "state": "in_flight", "owner": "vp-ownactive", "title": "live work"},
@@ -306,12 +307,54 @@ test_backlog_ownership_is_a_field_match_on_active_rows_not_a_substring_count() {
 ]}
 JSON
   )
-  run 0 "field-matched ownership" migrate_with_shim "$shim" "$world" vp-ownactive --role vp
+  run 0 "owner-field ownership" migrate_with_shim "$shim" "$world" vp-ownactive --role vp
   receipt="$world/receipts/vp-ownactive.receipt"
-  assert_grep "gate: beads-ownership: pass (2 of 4 active row(s) name vp-ownactive by field match [owner=1 id=0 text=1]" "$receipt" \
-    "only active rows naming the VP in a named field are counted"
+  assert_grep "gate: beads-ownership: pass (1 of 4 active row(s) name vp-ownactive in an owner field" "$receipt" \
+    "only an owner field equal to the VP counts toward the pass"
+  assert_grep "1 mention vp-ownactive in title/body, not counted" "$receipt" \
+    "a title mention is reported and labelled not-counted, never counted as ownership"
+  assert_no_grep "2 of 4" "$receipt" "the row owned by someone else must not be counted as the VP's"
   assert_grep "list --json" "$receipt" "the receipt names the structured query it ran"
-  pass "backlog ownership counts active rows by field match, not substrings of arbitrary text"
+
+  # A row whose id equals the VP name is not ownership either: an id is an
+  # identifier, not an owner, and the VP's own name as a row id says nothing
+  # about who holds the row.
+  world=$(make_world ownid)
+  shim=$(tasks_axi_shim "$world" <<'JSON'
+{"tasks": [
+  {"id": "vp-ownid", "state": "in_flight", "owner": "someone-else", "title": "a row named after the VP"}
+]}
+JSON
+  )
+  run 0 "id equal to the VP" migrate_with_shim "$shim" "$world" vp-ownid --role vp
+  receipt="$world/receipts/vp-ownid.receipt"
+  assert_grep "gate: beads-ownership: pass (0 of 1 active row(s) name vp-ownid in an owner field" "$receipt" \
+    "a row id equal to the VP name is not an ownership claim"
+  pass "backlog ownership counts an owner field equal to the VP and nothing else"
+}
+
+test_rows_with_no_owner_field_are_unmeasured_rather_than_counted_by_mention() {
+  local world receipt shim
+  # A listing that never expresses ownership cannot be read for ownership. A
+  # zero here would be an artefact of the schema, and counting the mentions
+  # instead was the false-ownership path: the gate says unmeasured and reports
+  # the mentions as the reason to look, not as a count of owned work.
+  world=$(make_world ownnofield)
+  shim=$(tasks_axi_shim "$world" <<'JSON'
+{"tasks": [
+  {"id": "t-1", "state": "in_flight", "title": "vp-ownnofield is mentioned here"},
+  {"id": "t-2", "state": "queued", "body": "escalate to vp-ownnofield"},
+  {"id": "t-3", "state": "Done", "title": "vp-ownnofield finished this"}
+]}
+JSON
+  )
+  run 0 "rows carry no owner field" migrate_with_shim "$shim" "$world" vp-ownnofield --role vp
+  receipt="$world/receipts/vp-ownnofield.receipt"
+  assert_grep "gate: beads-ownership: skipped (unmeasured: rows carry no owner field; 2 active rows mention vp-ownnofield in title/body, not counted)" "$receipt" \
+    "rows with no owner field are unmeasured, with the mentions reported and not counted"
+  assert_no_grep "gate: beads-ownership: pass" "$receipt" \
+    "a listing that never expresses ownership must not read as a measured zero or a count"
+  pass "rows carrying no owner field are unmeasured, never ownership inferred from a mention"
 }
 
 test_a_real_zero_passes_while_an_unreadable_or_absent_backlog_does_not() {
@@ -557,7 +600,8 @@ test_an_unknown_or_ambiguous_vp_is_refused_not_guessed
 test_execute_is_refused_and_names_what_it_would_do
 test_the_cutover_is_not_implemented_at_all
 test_a_receipt_never_references_a_live_session
-test_backlog_ownership_is_a_field_match_on_active_rows_not_a_substring_count
+test_backlog_ownership_counts_only_an_owner_field_equal_to_the_vp
+test_rows_with_no_owner_field_are_unmeasured_rather_than_counted_by_mention
 test_a_real_zero_passes_while_an_unreadable_or_absent_backlog_does_not
 test_the_machine_handoff_gate_is_tabled_and_never_passes
 test_a_receipt_destination_inside_the_live_chief_home_is_refused

@@ -65,9 +65,11 @@
 #                          read-only, through `bin/fm-tasks-axi.sh list --json`
 #                          (never a bare backend CLI, and never a substring
 #                          count of a human listing): rows are selected on their
-#                          own state field and the VP is matched against named
-#                          fields. An unreadable shape is `fail`, a wrapper
-#                          failure is `unmeasured`, and a real zero is a pass
+#                          own state field and ownership is an owner-field match
+#                          only - a title mention is reported, never counted.
+#                          An unreadable shape is `fail`; a wrapper failure, or
+#                          rows carrying no owner field at all, is `unmeasured`;
+#                          a real zero is a pass
 #   home-seed              a scoped home + route can be seeded (fm-home-seed.sh)
 #   route-register         the resulting registry bindings validate
 #   reconcile              the replacement would reconcile its books
@@ -450,10 +452,25 @@ fi
 # on their own `state` field, and the VP is matched against named fields rather
 # than against the rendered row.
 #
-# Three distinct outcomes, and only one of them is a pass:
-#   pass        the query parsed; the count is real, zero included
+# OWNERSHIP IS AN OWNER-FIELD MATCH, AND ONLY THAT. A row counts toward the pass
+# only when an owner-shaped field (`owner`, `assignee`, `assigned_to`,
+# `owner_id`) equals the VP exactly. An `id` equal to the VP name, and a mention
+# of the VP in `title`/`body`/`summary`, used to count too, which asserted
+# ownership of work another owner field explicitly gave to somebody else: "hand
+# off to vp-x", owned by someone-else, was counted as vp-x's. Mentions are still
+# counted, reported, and labelled not-counted, because they are the reason an
+# operator may want to look - not evidence of ownership. When a row carries an
+# owner field naming someone else, the row is not the VP's whatever its title
+# says.
+#
+# Four distinct outcomes, and only one of them is a pass:
+#   pass        the query parsed and the rows carry owner fields; the count is
+#               real, zero included
 #   unmeasured  the wrapper failed (tasks-axi absent, no backlog resolved, or
-#               --json unsupported) - never a falsely reassuring empty set
+#               --json unsupported) - never a falsely reassuring empty set - or
+#               the active rows carry no owner-shaped field at all, so ownership
+#               was never expressed in this listing and a zero would be an
+#               artefact of the schema rather than a reading
 #   fail        the query returned something this cannot parse. A shape nobody
 #               can read is not an absence of owned work.
 # Only `.owner`/`.state` style fields are consulted; nothing is written, and
@@ -510,50 +527,40 @@ if rows and all(state_of(row) is None for row in rows):
 
 # A whole-token match, so vp-x does not match vp-xenon or a path fragment.
 token = re.compile(r"(?<![0-9A-Za-z._-])%s(?![0-9A-Za-z._-])" % re.escape(want))
-active = owned = by_owner = by_id = by_text = 0
+active = owned = owner_rows = mentions = 0
 for row in rows:
     if state_of(row) not in ACTIVE:
         continue
     active += 1
-    hit = None
+    owner = None
     for key in OWNER_FIELDS:
         value = row.get(key)
-        if isinstance(value, str) and value.strip() == want:
-            hit = "owner"
+        if isinstance(value, str) and value.strip():
+            owner = value.strip()
             break
-    if hit is None:
-        value = row.get("id")
-        if isinstance(value, str) and value.strip() == want:
-            hit = "id"
-    if hit is None:
-        for key in TEXT_FIELDS:
-            value = row.get(key)
-            if isinstance(value, str) and token.search(value):
-                hit = "text"
-                break
-    if hit == "owner":
-        by_owner += 1
-    elif hit == "id":
-        by_id += 1
-    elif hit == "text":
-        by_text += 1
-    if hit:
-        owned += 1
-print("%d %d owner=%d id=%d text=%d" % (owned, active, by_owner, by_id, by_text))
+    if owner is not None:
+        owner_rows += 1
+        if owner == want:
+            owned += 1
+    for key in TEXT_FIELDS:
+        value = row.get(key)
+        if isinstance(value, str) and token.search(value):
+            mentions += 1
+            break
+print("%d %d %d %d" % (owned, active, owner_rows, mentions))
 PY
   )
   if [ $? -ne 0 ]; then
     fail_gate beads-ownership "fm-tasks-axi.sh list --json returned something this cannot read, so ownership is unknown rather than empty: $OWNERSHIP"
     finish
   fi
-  OWNERSHIP_REST=${OWNERSHIP#* }
-  OWNED=${OWNERSHIP%% *}
-  ACTIVE_ROWS=${OWNERSHIP_REST%% *}
-  MATCH_BASIS=${OWNERSHIP_REST#* }
+  IFS=' ' read -r OWNED ACTIVE_ROWS OWNER_ROWS MENTIONS <<< "$OWNERSHIP"
   if [ "$ACTIVE_ROWS" = 0 ]; then
     record beads-ownership pass "0 active rows in $repo_abs: nothing in flight, queued or blocked (read-only, via fm-tasks-axi.sh list --json)"
+  elif [ "$OWNER_ROWS" = 0 ]; then
+    record beads-ownership skipped "unmeasured: rows carry no owner field; $MENTIONS active rows mention $VP in title/body, not counted"
   else
-    record beads-ownership pass "$OWNED of $ACTIVE_ROWS active row(s) name $VP by field match [$MATCH_BASIS] in $repo_abs (read-only, via fm-tasks-axi.sh list --json)"
+    record beads-ownership pass "$OWNED of $ACTIVE_ROWS active row(s) name $VP in an owner field in $repo_abs; $MENTIONS mention $VP in title/body, not counted (read-only, via fm-tasks-axi.sh list --json)"
   fi
 fi
 
