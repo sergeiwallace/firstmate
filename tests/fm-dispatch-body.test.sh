@@ -241,16 +241,20 @@ test_first_claim_wins_the_body_and_later_routes_get_the_receipt() {
   pass "the first claim receives the body once; every later route receives only the receipt"
 }
 
-test_three_route_race_has_exactly_one_winner() {
+test_every_route_race_has_exactly_one_winner() {
   local home db i winners=0 losers=0 leaks=0
+  # Every route fm-receive.sh accepts, buzz included: the claim gate is what
+  # keeps a second transport from delivering the same body, so a route missing
+  # from this race is a route whose exclusivity nobody measured.
+  local routes="native buzz agent-mail fm-send"
   home=$(new_home race)
   db="$home/dispatch-bodies.sqlite3"
   run 0 "stage" stage "$db" cos-5 --body-file "$BODY_FILE"
-  for i in native agent-mail fm-send; do
+  for i in $routes; do
     ( "$RECEIVE" --db "$db" --dispatch-id cos-5 --vp-id vp/ai-harness/primary --route "$i" > "$TMP_ROOT/race-$i.out" 2>&1; printf '%s' $? > "$TMP_ROOT/race-$i.rc" ) &
   done
   wait
-  for i in native agent-mail fm-send; do
+  for i in $routes; do
     case "$(cat "$TMP_ROOT/race-$i.rc")" in
       0) winners=$((winners + 1)); grep -q "invoke your /next" "$TMP_ROOT/race-$i.out" || fail "winner $i lacks the body" ;;
       4) losers=$((losers + 1)); grep -q "invoke your /next" "$TMP_ROOT/race-$i.out" && leaks=$((leaks + 1)) ;;
@@ -258,9 +262,34 @@ test_three_route_race_has_exactly_one_winner() {
     esac
   done
   assert_equals 1 "$winners" "exactly one route wins a concurrent claim"
-  assert_equals 2 "$losers" "the other two routes get receipts"
+  assert_equals 3 "$losers" "every other route gets a receipt"
   assert_equals 0 "$leaks" "no loser output contains the body"
-  pass "three concurrent routes on one staged dispatch produce exactly one winner and no body leak"
+  pass "four concurrent routes on one staged dispatch produce exactly one winner and no body leak"
+}
+
+test_a_buzz_claim_wins_and_locks_out_every_other_route() {
+  local home db token
+  # Buzz is the primary cross-machine transport, so it has to be a first-class
+  # claimant rather than only a loser: a winning buzz claim must receive the
+  # body exactly once and shut out native, agent-mail and fm-send behind it.
+  home=$(new_home buzzclaim)
+  db="$home/dispatch-bodies.sqlite3"
+  run 0 "stage" stage "$db" cos-buzz --body-file "$BODY_FILE"
+  run 0 "buzz claim" env FM_HOME="$home" "$RECEIVE" --db "$db" --dispatch-id cos-buzz --vp-id vp/ai-harness/primary --route buzz
+  assert_equals True "$(json winner)" "a buzz claim can win"
+  assert_equals "$BODY_SHA" "$(body_sha_of_json)" "the buzz winner receives the exact body"
+  assert_equals buzz "$(json receipt.winner_route)" "the receipt names buzz as the winner"
+  token=$(json claim_token)
+  [ "${#token}" -ge 32 ] || fail "claim token is unguessably long (got ${#token} chars)"
+  assert_present "$home/state/dispatch-inbox/cos-buzz.json" "the buzz winner writes the inbox receipt projection"
+  assert_no_grep "invoke your /next" "$home/state/dispatch-inbox/cos-buzz.json" "the projection carries no body"
+  local route
+  for route in native agent-mail fm-send; do
+    run 4 "$route claim after buzz won" "$RECEIVE" --db "$db" --dispatch-id cos-buzz --vp-id vp/ai-harness/primary --route "$route"
+    assert_not_contains "$OUT" "invoke your /next" "$route never sees a body buzz already claimed"
+    assert_equals buzz "$(json receipt.winner_route)" "the receipt still names buzz"
+  done
+  pass "a winning buzz claim receives the body once and every other route gets only the receipt"
 }
 
 test_wrong_target_or_hash_gets_nothing_and_changes_nothing() {
@@ -475,7 +504,8 @@ test_stage_refuses_invalid_input_before_any_change
 test_no_home_is_refused_not_guessed
 test_unowned_or_shared_database_is_refused
 test_first_claim_wins_the_body_and_later_routes_get_the_receipt
-test_three_route_race_has_exactly_one_winner
+test_every_route_race_has_exactly_one_winner
+test_a_buzz_claim_wins_and_locks_out_every_other_route
 test_wrong_target_or_hash_gets_nothing_and_changes_nothing
 test_unknown_id_is_expired_unknown
 test_expired_object_yields_receipt_and_the_body_is_nulled
