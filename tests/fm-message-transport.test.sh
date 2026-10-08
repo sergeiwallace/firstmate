@@ -435,6 +435,16 @@ test_buzz_probe_fails_closed_on_every_unusable_client() {
   run 0 "buzz-client naming a non-executable" \
     env PATH="$NET_FAKEBIN:$BASE_PATH" NET_MARKER="$marker" FM_HOME="$home" "$CLI" probe buzz
   assert_equals "buzz/unconfigured" "$OUT" "a non-executable client is unconfigured"
+  mkdir -p "$TMP_ROOT/buzz-client-is-a-directory"
+  printf '%s\n' "$TMP_ROOT/buzz-client-is-a-directory" > "$home/config/buzz-client"
+  run 0 "buzz-client naming a directory" \
+    env PATH="$NET_FAKEBIN:$BASE_PATH" NET_MARKER="$marker" FM_HOME="$home" "$CLI" probe buzz
+  assert_equals "buzz/unconfigured" "$OUT" "a directory client is unconfigured"
+  ln -s "$TMP_ROOT/buzz-client-is-a-directory" "$TMP_ROOT/buzz-client-symlink-to-dir"
+  printf '%s\n' "$TMP_ROOT/buzz-client-symlink-to-dir" > "$home/config/buzz-client"
+  run 0 "buzz-client naming a symlink to a directory" \
+    env PATH="$NET_FAKEBIN:$BASE_PATH" NET_MARKER="$marker" FM_HOME="$home" "$CLI" probe buzz
+  assert_equals "buzz/unconfigured" "$OUT" "a symlink-to-directory client is unconfigured"
   assert_absent "$marker" "no unusable-client path may invoke a network tool"
   pass "every unusable buzz client fails closed to unconfigured, never to ok"
 }
