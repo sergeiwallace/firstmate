@@ -59,8 +59,13 @@
 #   repo-scope             --repo is preserved: it contains the VP's own cwd
 #   charter                a charter brief is resolvable for the new home
 #   harness-selection      the harness family (and role, when supplied) carried over
-#   beads-ownership        the VP's in-progress/blocked backlog work, read-only,
-#                          through bin/fm-tasks-axi.sh (never a bare backend CLI)
+#   beads-ownership        the VP's in-flight/queued/blocked backlog work,
+#                          read-only, through `bin/fm-tasks-axi.sh list --json`
+#                          (never a bare backend CLI, and never a substring
+#                          count of a human listing): rows are selected on their
+#                          own state field and the VP is matched against named
+#                          fields. An unreadable shape is `fail`, a wrapper
+#                          failure is `unmeasured`, and a real zero is a pass
 #   home-seed              a scoped home + route can be seeded (fm-home-seed.sh)
 #   route-register         the resulting registry bindings validate
 #   reconcile              the replacement would reconcile its books
@@ -418,15 +423,122 @@ fi
 # rather than a bare backend CLI. The wrapper owns backlog addressing and
 # backend resolution, so going around it would read a different queue than the
 # lifecycle transitions do - which is exactly what fm-lint.sh's backend-purity
-# check refuses. The cost is that an absent tasks-axi makes this gate
-# unmeasurable, and an unmeasurable gate is recorded as such: an empty - and
-# therefore falsely reassuring - ownership set is never reported as a pass.
-BACKLOG_OUT=$(FM_HOME="${FM_HOME:-$repo_abs}" "$SCRIPT_DIR/fm-tasks-axi.sh" list 2>&1) || BACKLOG_OUT=
-if [ -z "$BACKLOG_OUT" ]; then
-  record beads-ownership skipped "unmeasured: the tasks-axi wrapper returned nothing for $repo_abs (tasks-axi absent, or no backlog resolved)"
+# check refuses.
+#
+# The query is structured - `list --json`, parsed - because the human listing
+# counted with `grep -c -- "$VP"` answered a different question than the gate
+# asks. That count rose on any line of arbitrary text containing the VP name as
+# a substring, including a finished row, a prose mention, and a longer name the
+# VP name is a prefix of; and it recorded `pass` on a zero that could equally
+# mean "nothing is owned" or "the listing format changed". Rows are now selected
+# on their own `state` field, and the VP is matched against named fields rather
+# than against the rendered row.
+#
+# Three distinct outcomes, and only one of them is a pass:
+#   pass        the query parsed; the count is real, zero included
+#   unmeasured  the wrapper failed (tasks-axi absent, no backlog resolved, or
+#               --json unsupported) - never a falsely reassuring empty set
+#   fail        the query returned something this cannot parse. A shape nobody
+#               can read is not an absence of owned work.
+# Only `.owner`/`.state` style fields are consulted; nothing is written, and
+# bin/fm-backlog-transition-lib.sh's `state`/`held`/`blocked` vocabulary
+# (`in_flight`, `queued`, plus the human `In flight`/`Queued` spellings) is what
+# "active" means here.
+BACKLOG_OUT=$(FM_HOME="${FM_HOME:-$repo_abs}" "$SCRIPT_DIR/fm-tasks-axi.sh" list --json 2>&1)
+BACKLOG_RC=$?
+if [ "$BACKLOG_RC" -ne 0 ] || [ -z "$BACKLOG_OUT" ]; then
+  record beads-ownership skipped "unmeasured: fm-tasks-axi.sh list --json exited $BACKLOG_RC for $repo_abs (tasks-axi absent, no backlog resolved, or --json unsupported)"
 else
-  OWNED=$(printf '%s\n' "$BACKLOG_OUT" | grep -c -- "$VP") || OWNED=0
-  record beads-ownership pass "$OWNED backlog row(s) mentioning $VP in $repo_abs (read-only, via fm-tasks-axi.sh)"
+  # The listing travels in the environment, not on stdin: stdin carries the
+  # program, exactly as the other python3 steps in this file do.
+  OWNERSHIP=$(FM_VP_MIGRATE_BACKLOG_JSON="$BACKLOG_OUT" python3 - "$VP" 2>&1 <<'PY'
+import json, os, re, sys
+
+WRAPPERS = ("tasks", "rows", "items", "entries", "backlog")
+OWNER_FIELDS = ("owner", "assignee", "assigned_to", "owner_id")
+TEXT_FIELDS = ("title", "body", "summary")
+ACTIVE = {"in_flight", "queued", "blocked"}
+
+want = sys.argv[1]
+try:
+    doc = json.loads(os.environ["FM_VP_MIGRATE_BACKLOG_JSON"])
+except Exception as exc:
+    sys.exit("not JSON: %s" % exc)
+
+rows = None
+if isinstance(doc, list):
+    rows = doc
+elif isinstance(doc, dict):
+    for key in WRAPPERS:
+        if isinstance(doc.get(key), list):
+            rows = doc[key]
+            break
+if rows is None:
+    shape = "object with keys %s" % sorted(doc)[:8] if isinstance(doc, dict) else type(doc).__name__
+    sys.exit("no row list found: top level is a %s" % shape)
+if any(not isinstance(row, dict) for row in rows):
+    sys.exit("a row is not an object")
+
+
+def state_of(row):
+    for key in ("state", "status"):
+        value = row.get(key)
+        if isinstance(value, str):
+            return value.strip().lower().replace("-", "_").replace(" ", "_")
+    return None
+
+
+if rows and all(state_of(row) is None for row in rows):
+    keys = sorted({key for row in rows for key in row})[:12]
+    sys.exit("no row carries a state field; keys seen: %s" % keys)
+
+# A whole-token match, so vp-x does not match vp-xenon or a path fragment.
+token = re.compile(r"(?<![0-9A-Za-z._-])%s(?![0-9A-Za-z._-])" % re.escape(want))
+active = owned = by_owner = by_id = by_text = 0
+for row in rows:
+    if state_of(row) not in ACTIVE:
+        continue
+    active += 1
+    hit = None
+    for key in OWNER_FIELDS:
+        value = row.get(key)
+        if isinstance(value, str) and value.strip() == want:
+            hit = "owner"
+            break
+    if hit is None:
+        value = row.get("id")
+        if isinstance(value, str) and value.strip() == want:
+            hit = "id"
+    if hit is None:
+        for key in TEXT_FIELDS:
+            value = row.get(key)
+            if isinstance(value, str) and token.search(value):
+                hit = "text"
+                break
+    if hit == "owner":
+        by_owner += 1
+    elif hit == "id":
+        by_id += 1
+    elif hit == "text":
+        by_text += 1
+    if hit:
+        owned += 1
+print("%d %d owner=%d id=%d text=%d" % (owned, active, by_owner, by_id, by_text))
+PY
+  )
+  if [ $? -ne 0 ]; then
+    fail_gate beads-ownership "fm-tasks-axi.sh list --json returned something this cannot read, so ownership is unknown rather than empty: $OWNERSHIP"
+    finish
+  fi
+  OWNERSHIP_REST=${OWNERSHIP#* }
+  OWNED=${OWNERSHIP%% *}
+  ACTIVE_ROWS=${OWNERSHIP_REST%% *}
+  MATCH_BASIS=${OWNERSHIP_REST#* }
+  if [ "$ACTIVE_ROWS" = 0 ]; then
+    record beads-ownership pass "0 active rows in $repo_abs: nothing in flight, queued or blocked (read-only, via fm-tasks-axi.sh list --json)"
+  else
+    record beads-ownership pass "$OWNED of $ACTIVE_ROWS active row(s) name $VP by field match [$MATCH_BASIS] in $repo_abs (read-only, via fm-tasks-axi.sh list --json)"
+  fi
 fi
 
 # --- gate: home-seed ----------------------------------------------------------
