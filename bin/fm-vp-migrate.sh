@@ -1,0 +1,657 @@
+#!/usr/bin/env bash
+# fm-vp-migrate.sh - plan and record the migration of one existing VP session
+# into a scoped Firstmate secondmate home (design AIH-62xkr, T-3.1).
+#
+# Usage:
+#   fm-vp-migrate.sh <vp-name> --repo <path> --dry-run [options]
+#   fm-vp-migrate.sh <vp-name> --repo <path> --execute      (refused; see below)
+#
+#   --repo <path>          the repository this VP is scoped to (required)
+#   --dry-run              plan every gate and write a receipt; touch nothing
+#   --execute              REFUSED with status 2: the live cutover is an
+#                          operator step, not an automated one
+#   --home <path>          the secondmate home to seed (default:
+#                          <chief-home>/secondmates/<vp-name>)
+#   --receipt-dir <dir>    where to write <vp>.receipt (default: a fresh
+#                          mktemp -d under a dry run, NEVER the live chief home:
+#                          a value - or a TMPDIR - that resolves at or under the
+#                          effective home ($FM_HOME when set, otherwise the
+#                          --repo root, which is what every other home fallback
+#                          here uses) is refused with status 2, naming the path)
+#   --sessions-dir <dir>   where VP session records live
+#                          (default: ${XDG_CONFIG_HOME:-$HOME}/.claude/sessions)
+#   --role <role>          the VP's AI_SESSION_ROLE, which a Claude Code session
+#                          record does not carry; without it that gate records
+#                          `unmeasured` rather than inventing a value
+#   --from-machine <key>   the machine key the VP is owned by now (optional)
+#   --to-machine <key>     the machine key the VP would move to. Naming a key
+#                          that differs from --from-machine makes this a
+#                          cross-machine move, whose prepared/accepted handoff
+#                          protocol is NOT implemented here, so the
+#                          machine-handoff gate FAILS the plan (exit 1) and
+#                          never records `pass`. A machine key is always named, never
+#                          guessed from the host, matching bin/fm-vp-owner.py's
+#                          required --local-machine-key.
+#   --help
+#
+# WHAT THIS DOES NOT DO, BY CONSTRUCTION
+#
+# It never stops, signals, kills, attaches to, relaunches, or messages a live
+# session - not even the VP it is migrating. The sessions directory is read, and
+# only read. On this host aih-1, aih-2, aih-3, aih-4, kg-1, kg-2 and kg-3 are
+# live CC sessions whose records sit in that directory, so a migration tool that
+# treated a record as a handle would be one bug away from dropping a colleague's
+# session. The cutover - stop the old VP, launch the replacement, retire the
+# authority record - is deliberately NOT implemented: `--execute` refuses and
+# names what it would do, so there is no code path here that could perform it.
+#
+# T-3.1's gates, in order. A dry run plans each one and records
+# pass | fail | skipped(dry-run) | skipped (unmeasured: <why>); the first failure
+# stops the run, is named in the receipt, and exits non-zero with the old VP
+# still authoritative and nothing seeded.
+#
+# The receipt ALWAYS lists the full, fixed gate set below, whatever happened:
+# every gate after a failure is recorded `skipped (blocked by <failed-gate>)`
+# rather than omitted. An omitted gate and a gate nobody has implemented read
+# identically in a receipt, so a short receipt could not be told apart from a
+# complete one with gates missing - and T-3.1 asks for the gate table, not for
+# the prefix of it that ran.
+#
+#   vp-record              the named VP has exactly one readable session record
+#   repo-scope             --repo is preserved: it contains the VP's own cwd
+#   charter                a charter brief is resolvable for the new home
+#   harness-selection      the harness family (and role, when supplied) carried over
+#   beads-ownership        the VP's in-flight/queued/blocked backlog work,
+#                          read-only, through `bin/fm-tasks-axi.sh list --json`
+#                          (never a bare backend CLI, and never a substring
+#                          count of a human listing): rows are selected on their
+#                          own state field and ownership is an owner-field match
+#                          only - a title mention is reported, never counted.
+#                          An unreadable shape is `fail`; a wrapper failure, or
+#                          rows carrying no owner field at all, is `unmeasured`;
+#                          a real zero is a pass
+#   home-seed              a scoped home + route can be seeded (fm-home-seed.sh)
+#   route-register         the resulting registry bindings validate
+#   reconcile              the replacement would reconcile its books
+#   native-dispatch-proof  one native SendMessage/ack/notify_when_idle cycle
+#   machine-handoff        a cross-machine move uses the prepared/accepted
+#                          handoff protocol and retires nothing until the
+#                          destination-bound next epoch and the acceptance
+#                          receipt agree (AIH-62xkr)
+#   cutover                retire the old VP and make the replacement authoritative
+#
+# reconcile, native-dispatch-proof and cutover cannot be proved without starting
+# a session, so under --dry-run they are always recorded as skipped(dry-run) and
+# never as pass. A receipt that claimed a native-dispatch proof nobody observed
+# is the one output that would make this tool dangerous. machine-handoff is
+# recorded `skipped (not applicable: same-machine migration)` for a same-machine
+# move, and FAILS the run when --to-machine names a different machine: the
+# protocol it requires has no implementation here, so the plan is incomplete
+# rather than complete-with-a-skip, and a pass is the one thing it must never
+# report.
+#
+# Exit codes: 0 the plan is complete and every reached gate passed; 1 a gate
+# failed (named in the receipt); 2 bad arguments, or --execute.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fm-secondmate-registry-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-secondmate-registry-lib.sh"
+
+usage() {
+  awk '
+    NR == 1 { next }
+    /^#/ { sub(/^# ?/, ""); print; next }
+    { exit }
+  ' "$0"
+}
+
+refuse() {  # <status> <message>
+  printf 'fm-vp-migrate: %s\n' "$2" >&2
+  exit "$1"
+}
+
+# physical_path <path>: the physical absolute spelling of <path>, resolved
+# without creating it. The deepest existing ancestor is resolved with `pwd -P`
+# and the missing tail is re-appended, because the receipt directory usually
+# does not exist yet and a comparison against an unresolved spelling is not a
+# comparison: /tmp is a symlink on macOS, `..` and a symlinked --receipt-dir
+# both re-enter directories a literal prefix test says they are outside of.
+# bin/fm-ff-lib.sh ships resolve_path/path_is_ancestor_of for the existing-path
+# case; that library is the git self-sync machinery and requires FM_ROOT and
+# FM_HOME to be set, which this planner deliberately does not, so the two
+# non-existent-tail-safe lines live here instead.
+physical_path() {  # <path>
+  local p=$1 rest= base
+  [ -n "$p" ] || return 1
+  case "$p" in
+    /*) ;;
+    *) p="$(pwd -P)/$p" ;;
+  esac
+  while [ "$p" != / ] && [ ! -d "$p" ]; do
+    rest="$(basename "$p")${rest:+/$rest}"
+    p="$(dirname "$p")"
+  done
+  base=$(CDPATH='' cd -P -- "$p" 2>/dev/null && pwd -P) || base=$p
+  printf '%s' "${base%/}${rest:+/$rest}"
+}
+
+# path_at_or_under <candidate> <ancestor>: true when candidate IS ancestor or
+# sits beneath it. Both arguments must already be physical.
+path_at_or_under() {  # <candidate> <ancestor>
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  [ "$1" != "$2" ] || return 0
+  case "$1" in
+    "$2"/*) return 0 ;;
+  esac
+  return 1
+}
+
+# refuse_inside_chief_home <label> <path>: the "a dry run never lands in the
+# live chief home" guarantee, enforced rather than merely defaulted. Without
+# this it was bypassable - `--receipt-dir "$FM_HOME/state/migrations"`, or
+# TMPDIR pointing into the home, wrote a planner receipt into the live chief
+# home while that same receipt declared nothing live had been touched.
+# <chief-home>/state/migrations/<vp>.receipt belongs to the operator's real
+# cutover, which this script does not perform.
+#
+# It keys on EFFECTIVE_HOME, never on FM_HOME: an earlier version returned
+# immediately whenever FM_HOME was unset, yet the gates below fall back to the
+# repo root as the home (the backlog query's FM_HOME, the default secondmate
+# home, the registry path), so with FM_HOME unset a receipt could still land in
+# the directory this run itself treats as the live home. The home the guard
+# refuses and the home the gates use must be the same string.
+refuse_inside_chief_home() {  # <label> <path>
+  [ -n "${EFFECTIVE_HOME:-}" ] || return 0
+  local abs
+  abs=$(physical_path "$2") || return 0
+  if path_at_or_under "$abs" "$EFFECTIVE_HOME"; then
+    refuse 2 "$1 resolves inside the live chief home: $abs is at or under $EFFECTIVE_HOME; a dry-run receipt must never land there"
+  fi
+}
+
+VP=
+REPO=
+HOME_DIR=
+RECEIPT_DIR=
+SESSIONS_DIR=
+ROLE=
+FROM_MACHINE=
+TO_MACHINE=
+MODE=
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) [ $# -ge 2 ] || refuse 2 "--repo requires a path"; REPO=$2; shift 2 ;;
+    --home) [ $# -ge 2 ] || refuse 2 "--home requires a path"; HOME_DIR=$2; shift 2 ;;
+    --receipt-dir) [ $# -ge 2 ] || refuse 2 "--receipt-dir requires a path"; RECEIPT_DIR=$2; shift 2 ;;
+    --sessions-dir) [ $# -ge 2 ] || refuse 2 "--sessions-dir requires a path"; SESSIONS_DIR=$2; shift 2 ;;
+    --role) [ $# -ge 2 ] || refuse 2 "--role requires a value"; ROLE=$2; shift 2 ;;
+    --from-machine) [ $# -ge 2 ] || refuse 2 "--from-machine requires a machine key"; FROM_MACHINE=$2; shift 2 ;;
+    --to-machine) [ $# -ge 2 ] || refuse 2 "--to-machine requires a machine key"; TO_MACHINE=$2; shift 2 ;;
+    --dry-run)
+      [ -z "$MODE" ] || refuse 2 "name one of --dry-run or --execute, not both"
+      MODE=dry-run
+      shift
+      ;;
+    --execute)
+      [ -z "$MODE" ] || refuse 2 "name one of --dry-run or --execute, not both"
+      MODE=execute
+      shift
+      ;;
+    -h|--help) usage; exit 0 ;;
+    -*) refuse 2 "unknown option '$1' (see --help)" ;;
+    *)
+      [ -z "$VP" ] || refuse 2 "name exactly one VP (got '$VP' and '$1')"
+      VP=$1
+      shift
+      ;;
+  esac
+done
+
+[ -n "$VP" ] || refuse 2 "a VP name is required (see --help)"
+case "$VP" in
+  *[!A-Za-z0-9._-]*) refuse 2 "VP name '$VP' is not a safe session name" ;;
+esac
+[ -n "$REPO" ] || refuse 2 "--repo is required: a migration must preserve the VP's repo scope explicitly"
+[ -n "$MODE" ] || refuse 2 "name a mode: --dry-run plans and records; --execute is refused"
+
+# The live cutover is an operator step. This is a refusal, not a stub awaiting a
+# flag: nothing below this point can stop a session, because no such code
+# exists in this file.
+if [ "$MODE" = execute ]; then
+  printf 'fm-vp-migrate: live cutover is an operator step; see docs/configuration.md (VP-to-secondmate migration)\n' >&2
+  printf '%s\n' \
+    'Refused. --execute would, for this VP:' \
+    '  1. seed the scoped secondmate home and route planned by --dry-run' \
+    '  2. launch the replacement secondmate under that home' \
+    '  3. reconcile route, authority record/epoch, registry entry, owning-chief' \
+    '     routes, ListAgents identity, dispatch-body broker access and Beads work' \
+    '  4. prove one native SendMessage / acknowledgement / notify_when_idle cycle' \
+    '  5. retire the old VP session and make the replacement authoritative' \
+    'Steps 2 and 5 stop and start live CC sessions, so they stay with the' \
+    'operator. Run --dry-run, read the receipt, then perform the cutover by hand.' >&2
+  exit 2
+fi
+
+: "${SESSIONS_DIR:=${XDG_CONFIG_HOME:-$HOME}/.claude/sessions}"
+
+# The effective Firstmate home, resolved ONCE, physically, before anything is
+# written: FM_HOME when it is set, otherwise the repo root. Every later home
+# fallback in this file reads this variable rather than re-spelling
+# ${FM_HOME:-$repo_abs}, so the path the receipt guard refuses is by
+# construction the path the gates call the home.
+EFFECTIVE_HOME=$(physical_path "${FM_HOME:-$REPO}") || EFFECTIVE_HOME=
+
+# --- receipt ------------------------------------------------------------------
+#
+# A dry run's receipt never lands in the live chief home: with no --receipt-dir
+# it goes to a fresh temp directory. The live location
+# (<chief-home>/state/migrations/<vp>.receipt) belongs to the operator's real
+# cutover, which this script does not perform.
+#
+# Both spellings of the destination are checked BEFORE anything is created, and
+# the resolved result is checked again afterwards: mktemp follows a symlinked
+# TMPDIR, so the only spelling the guarantee can be stated about is the one the
+# receipt is actually written to.
+if [ -z "$RECEIPT_DIR" ]; then
+  TMP_BASE=${TMPDIR:-/tmp}
+  refuse_inside_chief_home "the TMPDIR a default receipt directory would use" "$TMP_BASE"
+  RECEIPT_DIR=$(mktemp -d "${TMP_BASE%/}/fm-vp-migrate.XXXXXX") \
+    || refuse 2 "could not create a receipt directory"
+else
+  refuse_inside_chief_home "--receipt-dir" "$RECEIPT_DIR"
+  mkdir -p "$RECEIPT_DIR" || refuse 2 "receipt directory is not writable: $RECEIPT_DIR"
+fi
+RECEIPT_DIR=$(physical_path "$RECEIPT_DIR") \
+  || refuse 2 "could not resolve the receipt directory to a physical path"
+refuse_inside_chief_home "the resolved receipt directory" "$RECEIPT_DIR"
+RECEIPT="$RECEIPT_DIR/$VP.receipt"
+
+# The fixed gate set T-3.1 asks the receipt to table, in the order the gates
+# run. This is the authority for what a receipt must list: finish() fills in
+# every entry no gate reached, so the receipt's gate list is this list whether
+# the plan completed or stopped at its first failure.
+ALL_GATES='vp-record repo-scope charter harness-selection beads-ownership home-seed route-register reconcile native-dispatch-proof machine-handoff cutover'
+
+GATE_LINES=
+FAILED_GATE=
+record() {  # <gate> <status> [detail]
+  local gate=$1 status=$2 detail=${3-}
+  if [ -n "$detail" ]; then
+    GATE_LINES="${GATE_LINES}gate: $gate: $status ($detail)"$'\n'
+  else
+    GATE_LINES="${GATE_LINES}gate: $gate: $status"$'\n'
+  fi
+}
+
+fail_gate() {  # <gate> <detail>
+  FAILED_GATE=$1
+  record "$1" fail "$2"
+}
+
+gate_recorded() {  # <gate>
+  case $'\n'"$GATE_LINES" in
+    *$'\n'"gate: $1: "*) return 0 ;;
+  esac
+  return 1
+}
+
+# Every gate the run never reached is recorded as blocked by the one that
+# failed, so the receipt tables the whole fixed gate set rather than the prefix
+# that ran. An omitted gate reads exactly like a gate nobody implemented.
+record_blocked_gates() {
+  local gate
+  for gate in $ALL_GATES; do
+    gate_recorded "$gate" || record "$gate" skipped "blocked by $FAILED_GATE"
+  done
+}
+
+write_receipt() {
+  {
+    printf 'receipt: vp-to-secondmate migration\n'
+    printf 'vp: %s\n' "$VP"
+    printf 'mode: %s\n' "$MODE"
+    printf 'repo: %s\n' "$REPO"
+    printf 'home: %s\n' "${HOME_DIR:-<unresolved>}"
+    printf '%s' "$GATE_LINES"
+    if [ -n "$FAILED_GATE" ]; then
+      printf 'result: FAILED at gate %s\n' "$FAILED_GATE"
+    else
+      printf 'result: plan complete; no gate failed\n'
+    fi
+    printf 'rollback: the old VP session %s stays authoritative; it was never stopped, signalled or messaged\n' "$VP"
+    if [ -n "$FAILED_GATE" ]; then
+      printf 'rollback: the failed home is preserved for diagnosis, not removed\n'
+    fi
+    printf 'rollback: no live session was touched by this run\n'
+    printf 'cutover: operator step; --execute is refused by this tool\n'
+  } > "$RECEIPT" || refuse 2 "could not write the receipt: $RECEIPT"
+}
+
+finish() {
+  [ -z "$FAILED_GATE" ] || record_blocked_gates
+  write_receipt
+  printf 'receipt: %s\n' "$RECEIPT"
+  if [ -n "$FAILED_GATE" ]; then
+    printf 'fm-vp-migrate: failed at gate %s\n' "$FAILED_GATE" >&2
+    exit 1
+  fi
+  exit 0
+}
+
+# --- gate: vp-record ----------------------------------------------------------
+#
+# Read-only, and matched on the record's own `name` field rather than on a file
+# name, because the file is keyed by pid. A pid-keyed guess would migrate
+# whichever session happened to inherit that pid.
+VP_CWD=
+if [ ! -d "$SESSIONS_DIR" ]; then
+  fail_gate vp-record "sessions directory is absent: $SESSIONS_DIR"
+  finish
+fi
+VP_RECORD=$(
+  for f in "$SESSIONS_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    python3 - "$f" "$VP" <<'PY'
+import json, sys
+path, want = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as fh:
+        rec = json.load(fh)
+except Exception:
+    sys.exit(0)
+if isinstance(rec, dict) and rec.get("name") == want:
+    print(path)
+PY
+  done
+)
+case "$VP_RECORD" in
+  '') fail_gate vp-record "no session record names a VP called '$VP' under $SESSIONS_DIR"; finish ;;
+  *$'\n'*) fail_gate vp-record "more than one session record names '$VP'; refusing to guess which is authoritative"; finish ;;
+esac
+VP_CWD=$(python3 - "$VP_RECORD" <<'PY'
+import json, sys
+with open(sys.argv[1]) as fh:
+    rec = json.load(fh)
+print(rec.get("cwd", ""))
+PY
+)
+if [ -z "$VP_CWD" ]; then
+  fail_gate vp-record "the record for '$VP' carries no cwd, so its repo scope cannot be preserved"
+  finish
+fi
+record vp-record pass "$VP_RECORD"
+
+# --- gate: repo-scope ---------------------------------------------------------
+#
+# Preserving repo scope means the new home is scoped to the SAME repository the
+# VP already works in, so --repo must contain the VP's own cwd. A --repo that
+# does not is a mis-targeted migration, caught before anything is seeded.
+repo_abs=$(cd "$REPO" 2>/dev/null && pwd -P) || repo_abs=
+if [ -z "$repo_abs" ]; then
+  fail_gate repo-scope "--repo is not an existing directory: $REPO"
+  finish
+fi
+cwd_abs=$(cd "$VP_CWD" 2>/dev/null && pwd -P) || cwd_abs=$VP_CWD
+case "$cwd_abs/" in
+  "$repo_abs/"*) record repo-scope pass "$repo_abs contains the VP cwd $cwd_abs" ;;
+  *)
+    fail_gate repo-scope "the VP's cwd ($cwd_abs) is not inside --repo ($repo_abs)"
+    finish
+    ;;
+esac
+
+# --- gate: charter ------------------------------------------------------------
+CHARTER_SOURCE=
+if [ -n "${FM_SECONDMATE_CHARTER:-}" ]; then
+  CHARTER_SOURCE='FM_SECONDMATE_CHARTER (inline)'
+  record charter pass "$CHARTER_SOURCE"
+elif [ -f "$repo_abs/data/charter.md" ]; then
+  CHARTER_SOURCE="$repo_abs/data/charter.md"
+  record charter pass "$CHARTER_SOURCE"
+else
+  record charter skipped "unmeasured: no filled charter brief and FM_SECONDMATE_CHARTER is unset; the seed would derive one"
+fi
+
+# --- gate: harness-selection --------------------------------------------------
+#
+# A Claude Code session record carries its harness implicitly (version,
+# entrypoint, kind) but has no AI_SESSION_ROLE field, so the role is recorded as
+# unmeasured unless --role names it. Inventing one would silently re-charter the
+# migrated VP.
+HARNESS=$(python3 - "$VP_RECORD" <<'PY'
+import json, sys
+with open(sys.argv[1]) as fh:
+    rec = json.load(fh)
+print("claude" if rec.get("version") and rec.get("entrypoint") else "")
+PY
+)
+if [ -z "$HARNESS" ]; then
+  record harness-selection skipped "unmeasured: the record carries no harness marker"
+elif [ -n "$ROLE" ]; then
+  record harness-selection pass "harness=$HARNESS role=$ROLE"
+else
+  record harness-selection skipped "unmeasured: harness=$HARNESS, but the record carries no AI_SESSION_ROLE; pass --role to carry it over"
+fi
+
+# --- gate: beads-ownership ----------------------------------------------------
+#
+# Read-only in every branch, and read through the home's own tasks-axi wrapper
+# rather than a bare backend CLI. The wrapper owns backlog addressing and
+# backend resolution, so going around it would read a different queue than the
+# lifecycle transitions do - which is exactly what fm-lint.sh's backend-purity
+# check refuses.
+#
+# The query is structured - `list --json`, parsed - because the human listing
+# counted with `grep -c -- "$VP"` answered a different question than the gate
+# asks. That count rose on any line of arbitrary text containing the VP name as
+# a substring, including a finished row, a prose mention, and a longer name the
+# VP name is a prefix of; and it recorded `pass` on a zero that could equally
+# mean "nothing is owned" or "the listing format changed". Rows are now selected
+# on their own `state` field, and the VP is matched against named fields rather
+# than against the rendered row.
+#
+# OWNERSHIP IS AN OWNER-FIELD MATCH, AND ONLY THAT. A row counts toward the pass
+# only when an owner-shaped field (`owner`, `assignee`, `assigned_to`,
+# `owner_id`) equals the VP exactly. An `id` equal to the VP name, and a mention
+# of the VP in `title`/`body`/`summary`, used to count too, which asserted
+# ownership of work another owner field explicitly gave to somebody else: "hand
+# off to vp-x", owned by someone-else, was counted as vp-x's. Mentions are still
+# counted, reported, and labelled not-counted, because they are the reason an
+# operator may want to look - not evidence of ownership. When a row carries an
+# owner field naming someone else, the row is not the VP's whatever its title
+# says.
+#
+# Four distinct outcomes, and only one of them is a pass:
+#   pass        the query parsed and the rows carry owner fields; the count is
+#               real, zero included
+#   unmeasured  the wrapper failed (tasks-axi absent, no backlog resolved, or
+#               --json unsupported) - never a falsely reassuring empty set - or
+#               the active rows carry no owner-shaped field at all, so ownership
+#               was never expressed in this listing and a zero would be an
+#               artefact of the schema rather than a reading
+#   fail        the query returned something this cannot parse. A shape nobody
+#               can read is not an absence of owned work.
+# Only `.owner`/`.state` style fields are consulted; nothing is written, and
+# bin/fm-backlog-transition-lib.sh's `state`/`held`/`blocked` vocabulary
+# (`in_flight`, `queued`, plus the human `In flight`/`Queued` spellings) is what
+# "active" means here.
+BACKLOG_OUT=$(FM_HOME="$EFFECTIVE_HOME" "$SCRIPT_DIR/fm-tasks-axi.sh" list --json 2>&1)
+BACKLOG_RC=$?
+if [ "$BACKLOG_RC" -ne 0 ] || [ -z "$BACKLOG_OUT" ]; then
+  record beads-ownership skipped "unmeasured: fm-tasks-axi.sh list --json exited $BACKLOG_RC for $repo_abs (tasks-axi absent, no backlog resolved, or --json unsupported)"
+else
+  # The listing travels in the environment, not on stdin: stdin carries the
+  # program, exactly as the other python3 steps in this file do.
+  OWNERSHIP=$(FM_VP_MIGRATE_BACKLOG_JSON="$BACKLOG_OUT" python3 - "$VP" 2>&1 <<'PY'
+import json, os, re, sys
+
+WRAPPERS = ("tasks", "rows", "items", "entries", "backlog")
+OWNER_FIELDS = ("owner", "assignee", "assigned_to", "owner_id")
+TEXT_FIELDS = ("title", "body", "summary")
+ACTIVE = {"in_flight", "queued", "blocked"}
+
+want = sys.argv[1]
+try:
+    doc = json.loads(os.environ["FM_VP_MIGRATE_BACKLOG_JSON"])
+except Exception as exc:
+    sys.exit("not JSON: %s" % exc)
+
+rows = None
+if isinstance(doc, list):
+    rows = doc
+elif isinstance(doc, dict):
+    for key in WRAPPERS:
+        if isinstance(doc.get(key), list):
+            rows = doc[key]
+            break
+if rows is None:
+    shape = "object with keys %s" % sorted(doc)[:8] if isinstance(doc, dict) else type(doc).__name__
+    sys.exit("no row list found: top level is a %s" % shape)
+if any(not isinstance(row, dict) for row in rows):
+    sys.exit("a row is not an object")
+
+
+def state_of(row):
+    for key in ("state", "status"):
+        value = row.get(key)
+        if isinstance(value, str):
+            return value.strip().lower().replace("-", "_").replace(" ", "_")
+    return None
+
+
+if rows and all(state_of(row) is None for row in rows):
+    keys = sorted({key for row in rows for key in row})[:12]
+    sys.exit("no row carries a state field; keys seen: %s" % keys)
+
+# A whole-token match, so vp-x does not match vp-xenon or a path fragment.
+token = re.compile(r"(?<![0-9A-Za-z._-])%s(?![0-9A-Za-z._-])" % re.escape(want))
+active = owned = owner_rows = mentions = 0
+for row in rows:
+    if state_of(row) not in ACTIVE:
+        continue
+    active += 1
+    owner = None
+    for key in OWNER_FIELDS:
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            owner = value.strip()
+            break
+    if owner is not None:
+        owner_rows += 1
+        if owner == want:
+            owned += 1
+    for key in TEXT_FIELDS:
+        value = row.get(key)
+        if isinstance(value, str) and token.search(value):
+            mentions += 1
+            break
+print("%d %d %d %d" % (owned, active, owner_rows, mentions))
+PY
+  )
+  if [ $? -ne 0 ]; then
+    fail_gate beads-ownership "fm-tasks-axi.sh list --json returned something this cannot read, so ownership is unknown rather than empty: $OWNERSHIP"
+    finish
+  fi
+  IFS=' ' read -r OWNED ACTIVE_ROWS OWNER_ROWS MENTIONS <<< "$OWNERSHIP"
+  if [ "$ACTIVE_ROWS" = 0 ]; then
+    record beads-ownership pass "0 active rows in $repo_abs: nothing in flight, queued or blocked (read-only, via fm-tasks-axi.sh list --json)"
+  elif [ "$OWNER_ROWS" = 0 ]; then
+    record beads-ownership skipped "unmeasured: rows carry no owner field; $MENTIONS active rows mention $VP in title/body, not counted"
+  else
+    record beads-ownership pass "$OWNED of $ACTIVE_ROWS active row(s) name $VP in an owner field in $repo_abs; $MENTIONS mention $VP in title/body, not counted (read-only, via fm-tasks-axi.sh list --json)"
+  fi
+fi
+
+# --- gate: home-seed ----------------------------------------------------------
+#
+# Validated, never performed: a dry run proves the home PATH is seedable and
+# stops. The real seed is bin/fm-home-seed.sh, invoked by the operator's
+# cutover.
+: "${HOME_DIR:=$EFFECTIVE_HOME/secondmates/$VP}"
+case "$HOME_DIR" in
+  /*) ;;
+  *) fail_gate home-seed "the secondmate home must be an absolute path: $HOME_DIR"; finish ;;
+esac
+if [ -e "$HOME_DIR" ] && [ ! -d "$HOME_DIR" ]; then
+  fail_gate home-seed "the secondmate home path exists and is not a directory: $HOME_DIR"
+  finish
+fi
+if [ -d "$HOME_DIR" ] && [ ! -f "$HOME_DIR/.fm-secondmate-home" ]; then
+  fail_gate home-seed "$HOME_DIR already exists and is not a firstmate secondmate home; seeding would convert it in place"
+  finish
+fi
+seed_parent=$(dirname "$HOME_DIR")
+if [ ! -d "$seed_parent" ]; then
+  fail_gate home-seed "the secondmate home's parent directory does not exist: $seed_parent"
+  finish
+fi
+if [ ! -w "$seed_parent" ]; then
+  fail_gate home-seed "the secondmate home's parent directory is not writable: $seed_parent"
+  finish
+fi
+# Nothing was created: assert that, rather than assuming it.
+if [ ! -e "$HOME_DIR" ]; then
+  record home-seed "skipped(dry-run)" "would seed $HOME_DIR via fm-home-seed.sh '$VP' '$HOME_DIR' '$repo_abs'; path validated, nothing created"
+else
+  record home-seed "skipped(dry-run)" "would re-use the existing secondmate home $HOME_DIR; nothing written"
+fi
+
+# --- gate: route-register -----------------------------------------------------
+#
+# The registry is only READ. When a registry exists its bindings are validated
+# with the shipped parser (secondmate_registry_validate_bindings), so a
+# migration that would collide with, nest inside, or duplicate an existing
+# route fails here instead of after a half-written registry.
+REGISTRY=${FM_DATA_OVERRIDE:-$EFFECTIVE_HOME/data}/secondmates.md
+if [ -f "$REGISTRY" ]; then
+  if secondmate_registry_validate_bindings "$REGISTRY" secondmate_registry_path_key; then
+    if secondmate_registry_line_for_id "$REGISTRY" "$VP" >/dev/null 2>&1; then
+      record route-register "skipped(dry-run)" "$VP already has a registry binding at $SECONDMATE_REGISTRY_HOME; the seed would reconcile it"
+    else
+      record route-register "skipped(dry-run)" "existing bindings in $REGISTRY validate; would add a route for $VP"
+    fi
+  else
+    fail_gate route-register "$SECONDMATE_REGISTRY_ERROR"
+    finish
+  fi
+else
+  record route-register "skipped(dry-run)" "no registry at $REGISTRY yet; the seed would create the first binding"
+fi
+
+# --- the three gates a dry run cannot reach -----------------------------------
+record reconcile "skipped(dry-run)" "would run fm-secondmate-reconcile.sh against the replacement's home"
+record native-dispatch-proof "skipped(dry-run)" "requires a live replacement session; never recorded as pass by a dry run"
+
+# --- gate: machine-handoff ----------------------------------------------------
+#
+# AIH-62xkr: when a VP moves to another machine the system shall use the
+# prepared/accepted handoff protocol, and shall start no destination VP and
+# retire no source authority record until the destination-bound next epoch and
+# the acceptance receipt agree. A same-machine move does not invoke it. A
+# cross-machine one does, and there is no implementation of it here, so this
+# gate records `unimplemented` - not `pass`, and not nothing, because a gate
+# absent from the receipt reads exactly like a gate that passed silently.
+#
+# The machine key is named, never inferred from the host, matching
+# bin/fm-vp-owner.py's required --local-machine-key: a planner that guessed
+# "this machine" would call a cross-machine migration same-machine whenever the
+# guess was wrong, which is the direction that skips the protocol.
+#
+# A cross-machine move FAILS the gate rather than recording a skip and exiting
+# 0. The handoff protocol is REQUIRED for that move, so a plan that cannot
+# evaluate it is not a complete plan: `skipped` plus `result: plan complete`
+# plus exit 0 told an operator the cross-machine migration was planned end to
+# end, when the one requirement specific to it had no implementation at all. A
+# required gate nobody implemented is a failure, and the receipt says which.
+if [ -z "$TO_MACHINE" ] || [ "$TO_MACHINE" = "$FROM_MACHINE" ]; then
+  record machine-handoff skipped "not applicable: same-machine migration"
+else
+  fail_gate machine-handoff "unimplemented: cross-machine handoff protocol is gated; see design T-3.1"
+  finish
+fi
+
+record cutover "skipped(dry-run)" "operator step: stop $VP, make the replacement authoritative, retire the old authority record"
+
+finish

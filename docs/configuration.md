@@ -336,16 +336,16 @@ While the file exists, main's lease-checked commands also take the per-task leas
 
 A chief-of-staff home reaches the sessions it coordinates through a chain of transports it declares in `config/message-transports.json`.
 Native `ListAgents`/`SendMessage` is always the primary, because the outcomes the chain reasons about - a held copy, a copy accepted for an offline session, a delivered copy never activated - are native's own.
-Everything after it is declared: `fallbacks` is any subset of the known fallback adapters, Agent Mail and this repo's existing `fm-send.sh` route, in any order, and it may be empty.
+Everything after it is declared: `fallbacks` is any subset of the known fallback adapters - the Buzz relay, Agent Mail and this repo's existing `fm-send.sh` route - in any order, and it may be empty.
 **No fallback adapter is mandatory.** A home with no Agent Mail configured declares `"fallbacks": ["fm-send"]` and the chain works; a home with neither declares `[]` and the chain begins and ends at native.
 The loader still fails closed, naming the field, on anything outside that: an unknown adapter, `native` named as a fallback, a repeated adapter, a missing `fallbacks` key, an unknown key, or a timeout out of range.
-[`docs/examples/message-transports.json`](examples/message-transports.json) is the fleet default, which uses all three:
+[`docs/examples/message-transports.json`](examples/message-transports.json) is the fleet default, which uses every known adapter:
 
 ```json
 {
   "schema_version": 1,
   "primary": "native",
-  "fallbacks": ["agent-mail", "fm-send"],
+  "fallbacks": ["buzz", "agent-mail", "fm-send"],
   "offline_pending_timeout_seconds": 600,
   "native_activation_timeout_seconds": 600
 }
@@ -355,12 +355,12 @@ The loader still fails closed, naming the field, on anything outside that: an un
 | --- | --- |
 | `schema_version` | `1` |
 | `primary` | `"native"` |
-| `fallbacks` | an array of distinct known fallback adapters (`"agent-mail"`, `"fm-send"`) in the order they should be attempted; may be empty; never `"native"` |
+| `fallbacks` | an array of distinct known fallback adapters (`"buzz"`, `"agent-mail"`, `"fm-send"`) in the order they should be attempted; may be empty; never `"native"` |
 | `offline_pending_timeout_seconds` | whole seconds, 60-3600; default 600 when omitted |
 | `native_activation_timeout_seconds` | whole seconds, 60-3600; default 600 when omitted |
 
 Any unknown key, an unknown or repeated adapter, or a timeout that is zero, negative, fractional, or outside the range is refused before dispatch rather than clamped.
-[`bin/fm-message-transport.sh`](../bin/fm-message-transport.sh) is the command-line face of the policy ([`bin/fm-message-transport-lib.sh`](../bin/fm-message-transport-lib.sh) owns it): `--dry-run` validates and prints the declared chain (`native -> agent-mail -> fm-send` for the default, `native` alone for an empty list); `next <transport> <outcome>` answers what the policy allows after one attempt; `deadline` computes the durable accepted-offline or activation deadline once from the acceptance time; `check-dispatch` refuses a bare slash command, an unnamed skill, or a missing acknowledgement line before anything is sent.
+[`bin/fm-message-transport.sh`](../bin/fm-message-transport.sh) is the command-line face of the policy ([`bin/fm-message-transport-lib.sh`](../bin/fm-message-transport-lib.sh) owns it): `--dry-run` validates and prints the declared chain (`native -> buzz -> agent-mail -> fm-send` for the fleet default, `native` alone for an empty list); `next <transport> <outcome>` answers what the policy allows after one attempt; `deadline` computes the durable accepted-offline or activation deadline once from the acceptance time; `check-dispatch` refuses a bare slash command, an unnamed skill, or a missing acknowledgement line before anything is sent.
 Like `fm-send.sh`, the command requires `FM_HOME` (or `FM_CONFIG_OVERRIDE`) to be named rather than guessing a home; `next` reads the config too, because the successor of an adapter is a property of the declared chain.
 
 `next` maps each (adapter, outcome) pair to an outcome class - keep waiting, advance, done, or stop - and resolves that class against the declared chain, so the answer follows the config rather than a fixed successor.
@@ -369,6 +369,46 @@ An adapter the chain does not declare is refused rather than answered: with `"fa
 The two timeouts govern when a native copy that was accepted for an offline session, or delivered but never claimed by the recipient, releases the next declared fallback; a held native copy stays pending until Claude Code's documented terminal hold outcome and never releases a fallback.
 Nothing in this policy sends a message: the native adapter is owned by the coordinating agent, and `fm-send.sh` keeps its own exit and delivery contract unchanged when the chain reaches it.
 
+### The Buzz relay and its fail-closed probe
+
+`buzz` is the cross-machine relay rung. A harness that manages this fork seeds the chain it wants, and the fleet's own seeded order is `native -> buzz -> agent-mail -> fm-send`: Buzz is the primary cross-machine transport with Agent Mail behind it as the fallback, while same-machine delivery still goes native first. Membership in the known-adapter set is a vocabulary check, not an order, so a home may declare `buzz` anywhere in `fallbacks`, or leave it out.
+
+Buzz is the only adapter with a readiness probe, because it is the only one whose availability is a local, checkable fact - an installed executable:
+
+```sh
+fm-message-transport.sh probe buzz      # -> buzz/unconfigured | buzz/configured
+```
+
+The client is named by `<config>/buzz-client`, one line holding a path to an executable, read at call time rather than taken from the environment. The probe **fails closed** in every direction that is not a present, executable client - no file, a blank file, a named path that is absent, a named path that is not executable - and all of them report `buzz/unconfigured`, which the next-step table classifies as `advance`, so the chain moves on to the next declared adapter instead of stalling. `buzz/configured` is a readiness verdict only; it is never a dispatch outcome.
+
+The probe never executes the client, resolves a host, or opens a socket, and it has no `sent` outcome, so it cannot report a delivery it did not observe. Until a Buzz client is installed, nothing writes `buzz-client` and every probe reports `buzz/unconfigured` by construction - which is the intended behaviour, not a defect.
+
+`native`, `agent-mail` and `fm-send` have **no** readiness probe: native readiness is the recipient harness's own `ListAgents` answer, and the other two are policy-only here, reporting availability as a dispatch outcome (`agent-mail/unconfigured`, `fm-send/failed`). `probe` exits 2 naming any of them, so a caller can tell "not ready" from "not answerable".
+
+## VP-to-secondmate migration (bin/fm-vp-migrate.sh)
+
+[`bin/fm-vp-migrate.sh`](../bin/fm-vp-migrate.sh) plans the migration of one existing VP session into a scoped secondmate home and writes a receipt.
+
+**No existing VP session has been relaunched as a secondmate, and this tool cannot do it.** Relaunching the live VP sessions under Firstmate homes is an approved intent, not work this repo has performed: what shipped is the planner and its receipt, and the plan stays a plan until an operator performs the cutover by hand. That is by design rather than an unfinished step - the cutover stops and starts live CC sessions, so it belongs to a human, and `--execute` refuses outright instead of gating reachable code.
+
+```sh
+fm-vp-migrate.sh <vp-name> --repo <path> --dry-run [--home <path>] [--receipt-dir <dir>] [--role <role>] [--from-machine <key>] [--to-machine <key>]
+```
+
+It records one line per gate - `vp-record`, `repo-scope`, `charter`, `harness-selection`, `beads-ownership`, `home-seed`, `route-register`, `reconcile`, `native-dispatch-proof`, `machine-handoff`, `cutover` - as `pass`, `fail`, or `skipped`, plus the rollback plan. That gate set is fixed and the receipt always tables all of it: every gate after a failure is recorded `skipped (blocked by <failed-gate>)` rather than left out, because an omitted gate reads exactly like a gate that passed silently.
+
+`machine-handoff` is the cross-machine requirement: a VP moving to another machine must use the prepared/accepted handoff protocol, and nothing starts the destination VP or retires the source authority record until the destination-bound next epoch and the acceptance receipt agree. A same-machine move records `skipped (not applicable: same-machine migration)` and does not fail. Name `--to-machine <key>` (optionally with `--from-machine <key>`) and a differing destination **fails the plan**: the gate records `fail (unimplemented: cross-machine handoff protocol is gated; see design T-3.1)`, the later gates are `skipped (blocked by machine-handoff)`, the receipt says `result: FAILED at gate machine-handoff`, and the command exits 1. That protocol has no implementation here, so a cross-machine plan is incomplete rather than complete-with-a-skip - a skip plus exit 0 plus `plan complete` told an operator the migration was planned end to end when its one cross-machine requirement had never been evaluated. The gate never reports `pass`. Machine keys are named, never inferred from the host, the same way [`bin/fm-vp-owner.py`](../bin/fm-vp-owner.py) requires `--local-machine-key`: a wrong guess would call a cross-machine move same-machine, which is the direction that skips the protocol. A dry run writes its receipt to a fresh temp directory unless `--receipt-dir` names one, and never into a live chief home - that is enforced, not just defaulted: `--receipt-dir`, and the `TMPDIR` the default destination is created under, are resolved to physical paths and refused with status 2 when they land at or under the **effective home**, naming the resolved path. The effective home is `$FM_HOME` when set and the `--repo` root otherwise, resolved once up front; the fallback matters because with `FM_HOME` unset the gates themselves treat the repo root as the home (the backlog query's `FM_HOME`, the default `<home>/secondmates/<vp>` seed path, and `<home>/data/secondmates.md`), so a guard keyed on `FM_HOME` alone let a receipt land in the directory the same run calls the live home. A symlink or a `..` into the home is refused on the resolved spelling, because that is the spelling the write obeys.
+
+**A dry run touches nothing.** It reads session records, and only reads them, matching on each record's own `name` field rather than the pid-keyed file name. The three gates that cannot be observed without a live replacement session - `reconcile`, `native-dispatch-proof`, `cutover` - are always recorded as `skipped(dry-run)` and never as `pass`.
+
+Inputs that cannot be measured are recorded as unmeasured rather than fabricated: a Claude Code session record carries no `AI_SESSION_ROLE`, so pass `--role` to carry the role over.
+
+`beads-ownership` reads the backlog through `bin/fm-tasks-axi.sh list --json` - structured, read-only, and never a bare backend CLI - and has three distinct outcomes, only one of which is a `pass`. Rows are selected on their own `state` field (`in_flight`, `queued`, `blocked`, in either the machine or the human spelling). **Ownership is an owner-field match and only that:** a row counts toward the `pass` when an owner-shaped field (`owner`, `assignee`, `assigned_to`, `owner_id`) equals the VP exactly. A whole-token mention in `title`/`body`/`summary` is reported and labelled `not counted` - it is a reason to look, not evidence of ownership - and a row whose owner field names somebody else is not the VP's however its title reads. An `id` equal to the VP name is an identifier, not an owner, and no longer counts. A query that succeeded and found nothing active is a real `pass (0 active rows ...)`. A wrapper that failed - `tasks-axi` absent, no backlog resolved, `--json` unsupported - is `skipped (unmeasured: ...)`, because an empty and therefore falsely reassuring ownership set is the one answer this gate must never give; active rows that carry **no** owner-shaped field at all are `skipped (unmeasured: rows carry no owner field; N active rows mention <vp> in title/body, not counted)`, since a listing that never expresses ownership cannot be read for it and a zero would be an artefact of the schema. A listing it cannot parse, or valid JSON in an unrecognised shape, is a `fail`: unreadable ownership is unknown, not absent. Nothing is written to any backlog.
+
+On a failed gate the receipt names it, the command exits 1, the old VP stays authoritative, and the failed home is preserved for diagnosis. Nothing is half-seeded: an occupied home path, or an existing directory that is not a firstmate secondmate home, fails at `home-seed` before anything is written.
+
+**The live cutover is an operator step, and `--execute` is refused with status 2.** The cutover would stop the old VP session and launch its replacement; those steps drive live sessions, so they stay with a human. This is an absence rather than a gate - the script invokes no `kill`, `pkill`, `killall` or `tmux`, and `tests/fm-vp-migrate.test.sh` asserts that, because a refusal guarding reachable code would still be one edit away from running it. The refusal prints the five steps it declines to perform. Run `--dry-run`, read the receipt, then perform the cutover by hand.
+
 ### Dispatch-body broker (dispatch-bodies.sqlite3)
 
 The operational text of a dispatch never travels as authority. The owning chief home holds one SQLite database, `dispatch-bodies.sqlite3`, and [`bin/fm-dispatch-body.py`](../bin/fm-dispatch-body.py) (standard-library Python; no `sqlite3` CLI needed) is its only writer.
@@ -376,7 +416,7 @@ The operational text of a dispatch never travels as authority. The owning chief 
 Staging the same id with the same hash again is idempotent; the same id with a different body, target, epoch or timestamp is a terminal conflict (exit 3) and nothing is sent.
 Every write runs under `BEGIN IMMEDIATE` with `synchronous=FULL` and `secure_delete=ON`, followed by a directory fsync; the database is created 0600 and the broker refuses (exit 2) a database or home that another OS identity owns or could read or replace.
 
-[`bin/fm-receive.sh`](../bin/fm-receive.sh) is the recipient's claim gate. Whichever transport arrives first calls it with the dispatch id, the addressed `vp_id` and its route (`native`, `agent-mail`, `fm-send`), plus `--expected-hash` when the envelope carried one. One transaction moves `staged` to `claimed`, records the winning route and an unguessable claim token, and returns `body_utf8` to that caller alone (exit 0), also writing the `$FM_HOME/state/dispatch-inbox/<id>.json` receipt projection with `O_CREAT|O_EXCL`. Every other caller gets the stored receipt and never the body (exit 4): a loser route, a late doorbell after a fallback won, an expired or unknown id. The wrong target VP is refused (exit 2) and a mismatched envelope hash conflicts (exit 3), both leaving the object staged.
+[`bin/fm-receive.sh`](../bin/fm-receive.sh) is the recipient's claim gate. Whichever transport arrives first calls it with the dispatch id, the addressed `vp_id` and its route (`native`, `buzz`, `agent-mail`, `fm-send`), plus `--expected-hash` when the envelope carried one. One transaction moves `staged` to `claimed`, records the winning route and an unguessable claim token, and returns `body_utf8` to that caller alone (exit 0), also writing the `$FM_HOME/state/dispatch-inbox/<id>.json` receipt projection with `O_CREAT|O_EXCL`. Every other caller gets the stored receipt and never the body (exit 4): a loser route, a late doorbell after a fallback won, an expired or unknown id. The wrong target VP is refused (exit 2) and a mismatched envelope hash conflicts (exit 3), both leaving the object staged.
 `resume` re-reads a claimed body only with its own claim token; `inject` and `terminal` finish the claim and set the body to NULL in the same transaction; `reconcile-required` records a claimed row whose token or enqueue outcome cannot be proven, NULLs the body, and is never reset to staged; `expire-due` expires unclaimed rows past their deadline; `cleanup --journal <dispatch.jsonl>` removes finished receipts older than seven days only when the append-only journal already holds the same id, hash and terminal state.
 
 [`bin/fm-forward-receive.sh`](../bin/fm-forward-receive.sh) is what the owning chief runs from a forwarded, non-operational doorbell: it checks the forwarded owner epoch (a mismatch is `stale-owner`, exit 3, naming the current epoch) and hash, and returns metadata only so local transport selection can start. It never claims and never prints the body; only the target VP's own `fm-receive` claim can.

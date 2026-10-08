@@ -10,7 +10,8 @@
 #      ListAgents/SendMessage is always the primary (its outcomes - held,
 #      accepted-offline, activation - are native-specific, so the native-first
 #      principle is not configurable), and `fallbacks` is any subset of the
-#      known fallback adapters - Agent Mail and the existing fm-send.sh route -
+#      known fallback adapters - the Buzz relay, Agent Mail and the existing
+#      fm-send.sh route -
 #      in any order, INCLUDING NONE. No fallback adapter is mandatory, so a home
 #      with no Agent Mail configured declares a valid chain by leaving it out.
 #      The loader still FAILS CLOSED, naming the invalid field, on anything
@@ -54,7 +55,7 @@ FM_MT_SCHEMA_VERSION=1
 FM_MT_APPROVED_PRIMARY=native
 # The known fallback adapters. Membership is a vocabulary check, not an order:
 # a config may declare any subset of these, in any order, or none at all.
-FM_MT_KNOWN_FALLBACKS="agent-mail fm-send"
+FM_MT_KNOWN_FALLBACKS="buzz agent-mail fm-send"
 FM_MT_TIMEOUT_MIN=60
 FM_MT_TIMEOUT_MAX=3600
 FM_MT_TIMEOUT_DEFAULT=600
@@ -224,6 +225,16 @@ fm_mt_classify() {
     native/unresolved|native/refused|native/denied|native/expired) FM_MT_CLASS=advance ;;
     native/claimed) FM_MT_CLASS=done ;;
     native/ambiguous) FM_MT_CLASS=stop; FM_MT_DETAIL=reconcile ;;
+    # Buzz mirrors Agent Mail's outcome vocabulary exactly: it is a store-and-
+    # forward relay with the same four dispositions, so it needs no row Agent
+    # Mail does not have (notably no `sent`, which only the fire-and-forget
+    # fm-send route reports). `unconfigured` is what the fail-closed probe
+    # reports while no Buzz client is installed, so an unconfigured relay
+    # advances to the next declared adapter instead of stalling the chain.
+    buzz/unconfigured|buzz/cancelled|buzz/expired) FM_MT_CLASS=advance ;;
+    buzz/pending) FM_MT_CLASS=pending; FM_MT_DETAIL=buzz ;;
+    buzz/receipt|buzz/claimed) FM_MT_CLASS=done ;;
+    buzz/ambiguous) FM_MT_CLASS=stop; FM_MT_DETAIL=reconcile ;;
     agent-mail/unconfigured|agent-mail/cancelled|agent-mail/expired) FM_MT_CLASS=advance ;;
     agent-mail/pending) FM_MT_CLASS=pending; FM_MT_DETAIL=agent-mail ;;
     agent-mail/receipt|agent-mail/claimed) FM_MT_CLASS=done ;;
@@ -246,7 +257,7 @@ fm_mt_classify() {
 # (primary first, then the fallbacks in declared order). Requires a successful
 # fm_mt_load, because a successor is a property of that chain. Tokens:
 #   pending:<what>            keep waiting; no fallback (held, native-offline,
-#                             native-activation, agent-mail)
+#                             native-activation, buzz, agent-mail)
 #   fallback:<next>[:<record>] attempt <next>, the adapter declared after this
 #                             one, with the SAME dispatch id, after recording
 #                             <record> when present
@@ -303,6 +314,81 @@ fm_mt_next() {
       fi
       ;;
   esac
+}
+
+# fm_mt_probe <transport>
+# Print "<transport>/<outcome>" for one adapter's READINESS, without sending
+# anything. Only `buzz` has a probe in this fork; see the note below on why
+# Agent Mail has none.
+#
+# The buzz probe is a pure file read. The Buzz client is named by
+# <config>/buzz-client - one line holding the path to an executable - because a
+# transport's location must be a config file read at call time, not an
+# environment variable frozen when a session launched. It FAILS CLOSED in every
+# direction that is not a present, executable client:
+#
+#   no buzz-client file            -> buzz/unconfigured
+#   blank buzz-client file         -> buzz/unconfigured
+#   named path absent              -> buzz/unconfigured
+#   named path is a directory      -> buzz/unconfigured
+#   named path not executable      -> buzz/unconfigured
+#   named path executable          -> buzz/configured
+#
+# and `buzz/unconfigured` classifies as `advance`, so a home with no Buzz client
+# routes straight on to the next declared adapter rather than stalling. This is
+# the state the whole fleet is in today: the harness-side Buzz client (AIH-zwr6m)
+# has not landed, so nothing writes buzz-client yet and every probe here reports
+# unconfigured by construction.
+#
+# It NEVER executes the client, resolves a host, or opens a socket. A probe that
+# shelled out would turn a readiness question into a send, and a probe that
+# reported anything optimistic on a failed read would let the chain claim a
+# delivery nobody made. `configured` is a readiness verdict only: it is not a
+# dispatch outcome and is never fed to fm_mt_next.
+#
+# Returns 2 with FM_MT_ERROR for an adapter this fork cannot probe, so a caller
+# can tell "not ready" (a printed outcome) from "not answerable" (a refusal)
+# instead of reading one as the other.
+fm_mt_probe() {
+  local transport=$1 dir client
+  FM_MT_ERROR=
+  case "$transport" in
+    buzz) ;;
+    native|agent-mail|fm-send)
+      # Deliberate, not an oversight: native readiness is the recipient
+      # harness's own ListAgents answer (not a shell question at all), and
+      # Agent Mail and fm-send are policy-only in this fork - their
+      # availability is reported by the dispatching agent as an OUTCOME
+      # (agent-mail/unconfigured, fm-send/failed), never probed here. Buzz
+      # needs a probe because its client is an installed executable whose
+      # absence is a local, checkable fact.
+      FM_MT_ERROR="transport: '$transport' has no readiness probe in this fork; its availability is reported as a dispatch outcome"
+      return 2
+      ;;
+    *)
+      FM_MT_ERROR="transport: '$transport' is not one of ${FM_MT_APPROVED_PRIMARY}, ${FM_MT_KNOWN_FALLBACKS// /, }"
+      return 2
+      ;;
+  esac
+  if [ -n "${FM_CONFIG_OVERRIDE:-}" ]; then
+    dir=$FM_CONFIG_OVERRIDE
+  elif [ -n "${FM_HOME:-}" ]; then
+    dir=$FM_HOME/config
+  else
+    FM_MT_ERROR="FM_HOME is unset and FM_CONFIG_OVERRIDE is unset: name the operational home before probing a transport"
+    return 2
+  fi
+  if [ ! -f "$dir/buzz-client" ] || [ ! -r "$dir/buzz-client" ]; then
+    printf 'buzz/unconfigured\n'
+    return 0
+  fi
+  # First non-blank line, trimmed; a blank or whitespace-only file is unconfigured.
+  client=$(sed -n '/[^[:space:]]/{s/^[[:space:]]*//;s/[[:space:]]*$//;p;q;}' "$dir/buzz-client" 2>/dev/null) || client=
+  if [ -z "$client" ] || [ ! -f "$client" ] || [ ! -x "$client" ]; then
+    printf 'buzz/unconfigured\n'
+    return 0
+  fi
+  printf 'buzz/configured\n'
 }
 
 # fm_mt_deadline <accepted-epoch-seconds> <timeout-seconds>
