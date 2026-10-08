@@ -14,8 +14,10 @@
 #                          <chief-home>/secondmates/<vp-name>)
 #   --receipt-dir <dir>    where to write <vp>.receipt (default: a fresh
 #                          mktemp -d under a dry run, NEVER the live chief home:
-#                          a value - or a TMPDIR - that resolves at or under
-#                          $FM_HOME is refused with status 2, naming the path)
+#                          a value - or a TMPDIR - that resolves at or under the
+#                          effective home ($FM_HOME when set, otherwise the
+#                          --repo root, which is what every other home fallback
+#                          here uses) is refused with status 2, naming the path)
 #   --sessions-dir <dir>   where VP session records live
 #                          (default: ${XDG_CONFIG_HOME:-$HOME}/.claude/sessions)
 #   --role <role>          the VP's AI_SESSION_ROLE, which a Claude Code session
@@ -150,13 +152,19 @@ path_at_or_under() {  # <candidate> <ancestor>
 # home while that same receipt declared nothing live had been touched.
 # <chief-home>/state/migrations/<vp>.receipt belongs to the operator's real
 # cutover, which this script does not perform.
+#
+# It keys on EFFECTIVE_HOME, never on FM_HOME: an earlier version returned
+# immediately whenever FM_HOME was unset, yet the gates below fall back to the
+# repo root as the home (the backlog query's FM_HOME, the default secondmate
+# home, the registry path), so with FM_HOME unset a receipt could still land in
+# the directory this run itself treats as the live home. The home the guard
+# refuses and the home the gates use must be the same string.
 refuse_inside_chief_home() {  # <label> <path>
-  [ -n "${FM_HOME:-}" ] || return 0
-  local home abs
-  home=$(physical_path "$FM_HOME") || return 0
+  [ -n "${EFFECTIVE_HOME:-}" ] || return 0
+  local abs
   abs=$(physical_path "$2") || return 0
-  if path_at_or_under "$abs" "$home"; then
-    refuse 2 "$1 resolves inside the live chief home: $abs is at or under $home; a dry-run receipt must never land there"
+  if path_at_or_under "$abs" "$EFFECTIVE_HOME"; then
+    refuse 2 "$1 resolves inside the live chief home: $abs is at or under $EFFECTIVE_HOME; a dry-run receipt must never land there"
   fi
 }
 
@@ -225,6 +233,13 @@ if [ "$MODE" = execute ]; then
 fi
 
 : "${SESSIONS_DIR:=${XDG_CONFIG_HOME:-$HOME}/.claude/sessions}"
+
+# The effective Firstmate home, resolved ONCE, physically, before anything is
+# written: FM_HOME when it is set, otherwise the repo root. Every later home
+# fallback in this file reads this variable rather than re-spelling
+# ${FM_HOME:-$repo_abs}, so the path the receipt guard refuses is by
+# construction the path the gates call the home.
+EFFECTIVE_HOME=$(physical_path "${FM_HOME:-$REPO}") || EFFECTIVE_HOME=
 
 # --- receipt ------------------------------------------------------------------
 #
@@ -445,7 +460,7 @@ fi
 # bin/fm-backlog-transition-lib.sh's `state`/`held`/`blocked` vocabulary
 # (`in_flight`, `queued`, plus the human `In flight`/`Queued` spellings) is what
 # "active" means here.
-BACKLOG_OUT=$(FM_HOME="${FM_HOME:-$repo_abs}" "$SCRIPT_DIR/fm-tasks-axi.sh" list --json 2>&1)
+BACKLOG_OUT=$(FM_HOME="$EFFECTIVE_HOME" "$SCRIPT_DIR/fm-tasks-axi.sh" list --json 2>&1)
 BACKLOG_RC=$?
 if [ "$BACKLOG_RC" -ne 0 ] || [ -z "$BACKLOG_OUT" ]; then
   record beads-ownership skipped "unmeasured: fm-tasks-axi.sh list --json exited $BACKLOG_RC for $repo_abs (tasks-axi absent, no backlog resolved, or --json unsupported)"
@@ -547,7 +562,7 @@ fi
 # Validated, never performed: a dry run proves the home PATH is seedable and
 # stops. The real seed is bin/fm-home-seed.sh, invoked by the operator's
 # cutover.
-: "${HOME_DIR:=${FM_HOME:-$repo_abs}/secondmates/$VP}"
+: "${HOME_DIR:=$EFFECTIVE_HOME/secondmates/$VP}"
 case "$HOME_DIR" in
   /*) ;;
   *) fail_gate home-seed "the secondmate home must be an absolute path: $HOME_DIR"; finish ;;
@@ -582,7 +597,7 @@ fi
 # with the shipped parser (secondmate_registry_validate_bindings), so a
 # migration that would collide with, nest inside, or duplicate an existing
 # route fails here instead of after a half-written registry.
-REGISTRY=${FM_DATA_OVERRIDE:-${FM_HOME:-$repo_abs}/data}/secondmates.md
+REGISTRY=${FM_DATA_OVERRIDE:-$EFFECTIVE_HOME/data}/secondmates.md
 if [ -f "$REGISTRY" ]; then
   if secondmate_registry_validate_bindings "$REGISTRY" secondmate_registry_path_key; then
     if secondmate_registry_line_for_id "$REGISTRY" "$VP" >/dev/null 2>&1; then
