@@ -11,6 +11,12 @@
 #                                resolved against the declared chain, so this command
 #                                loads the config too (see the library header for the
 #                                token grammar)
+#   probe <transport>            print "<transport>/<outcome>" for that adapter's
+#                                readiness without sending anything; only buzz is
+#                                probeable (exit 2 names any adapter that is not).
+#                                buzz reads <config>/buzz-client and fails closed
+#                                to buzz/unconfigured unless it names an
+#                                executable; it never runs the client.
 #   deadline <accepted-epoch> offline|activation
 #                                print the durable deadline: acceptance time plus the
 #                                configured timeout, computed once
@@ -92,6 +98,10 @@ case "$COMMAND" in
     [ $# -eq 2 ] || refuse 2 "next requires <transport> <outcome>"
     load_config
     fm_mt_next "$1" "$2" || refuse 2 "$FM_MT_ERROR"
+    ;;
+  probe)
+    [ $# -eq 1 ] || refuse 2 "probe requires <transport>"
+    fm_mt_probe "$1" || refuse 2 "$FM_MT_ERROR"
     ;;
   deadline)
     [ $# -eq 2 ] || refuse 2 "deadline requires <accepted-epoch> offline|activation"

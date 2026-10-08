@@ -316,6 +316,172 @@ test_dispatch_without_skill_or_ack_is_refused() {
   pass "a dispatch without a named skill or ack line is refused"
 }
 
+# --- buzz: the fleet's cross-machine rung ------------------------------------------------------
+
+BUZZ_CHAIN='{"schema_version":1,"primary":"native","fallbacks":["buzz","agent-mail","fm-send"]}'
+
+test_the_fleet_seeded_buzz_chain_is_valid_and_ordered() {
+  local home="$TMP_ROOT/buzz-chain"
+  write_config "$home" "$BUZZ_CHAIN"
+  run 0 "dry-run on the fleet's seeded buzz chain" env FM_HOME="$home" "$CLI" --dry-run
+  assert_equals "native -> buzz -> agent-mail -> fm-send" "$OUT" \
+    "the harness-seeded chain must validate and print in declared order"
+  run 0 "validate resolves buzz" env FM_HOME="$home" "$CLI" validate
+  assert_contains "$OUT" "fallbacks=buzz agent-mail fm-send" "buzz resolves as a declared fallback"
+  pass "the harness-seeded native -> buzz -> agent-mail -> fm-send chain is valid"
+}
+
+test_buzz_next_step_rows_mirror_agent_mail() {
+  local home="$TMP_ROOT/buzz-next"
+  write_config "$home" "$BUZZ_CHAIN"
+  NEXT_HOME=$home
+  # An unconfigured relay advances to the NEXT DECLARED adapter, so a fleet with
+  # no Buzz client installed still reaches Agent Mail.
+  expect_next buzz unconfigured fallback:agent-mail
+  expect_next buzz cancelled fallback:agent-mail
+  expect_next buzz expired fallback:agent-mail
+  expect_next buzz pending pending:buzz
+  expect_next buzz receipt done:buzz
+  expect_next buzz claimed done:buzz
+  expect_next buzz ambiguous stop:reconcile
+  # Native now releases buzz rather than agent-mail, because order is declared.
+  expect_next native refused fallback:buzz
+  expect_next native offline-timeout fallback:buzz:native-timeout
+  NEXT_HOME=$FLEET_HOME
+  pass "buzz's next-step rows mirror agent-mail and resolve against the declared chain"
+}
+
+test_buzz_has_no_sent_outcome() {
+  local home="$TMP_ROOT/buzz-no-sent"
+  write_config "$home" "$BUZZ_CHAIN"
+  # fm-send/sent exists because fm-send is fire-and-forget; a store-and-forward
+  # relay must never report a bare "sent" that would read as delivery.
+  run 2 "buzz sent" env FM_HOME="$home" "$CLI" next buzz sent
+  assert_contains "$OUT" "not a known buzz outcome" "buzz must not carry fm-send's sent outcome"
+  pass "buzz has no 'sent' outcome, so it cannot claim delivery it did not observe"
+}
+
+test_an_unknown_adapter_is_still_refused_naming_the_field() {
+  # Widening the vocabulary by one must not open it: "hive" is Sergei's informal
+  # name for Buzz and is NOT an adapter name.
+  expect_invalid "hive is not an adapter" \
+    '{"schema_version":1,"primary":"native","fallbacks":["hive","agent-mail"]}' "fallbacks"
+  assert_contains "$OUT" 'got "hive"' "the refusal quotes the unknown adapter"
+  assert_contains "$OUT" '"buzz"' "the refusal enumerates the known adapters including buzz"
+  pass "an unknown adapter is still refused, naming the field and the offending name"
+}
+
+test_a_chain_may_declare_buzz_without_agent_mail() {
+  local home="$TMP_ROOT/buzz-only"
+  write_config "$home" '{"schema_version":1,"primary":"native","fallbacks":["buzz"]}'
+  run 0 "dry-run with buzz as the only fallback" env FM_HOME="$home" "$CLI" --dry-run
+  assert_equals "native -> buzz" "$OUT" "buzz alone is a valid two-step chain"
+  NEXT_HOME=$home
+  expect_next native refused fallback:buzz
+  expect_next buzz unconfigured stop:exhausted
+  NEXT_HOME=$FLEET_HOME
+  pass "buzz may be declared without agent-mail, and exhausts as the last adapter"
+}
+
+# --- the buzz readiness probe fails closed and sends nothing -----------------------------------
+
+# A PATH holding nothing but loud failures for every network tool the probe
+# could reach for. If the probe ever shells out, the stub writes its name to
+# $NET_MARKER, so "no network action" is proved by the absence of a file a real
+# call would have created - not by inspection.
+NET_FAKEBIN="$TMP_ROOT/netfakebin"
+mkdir -p "$NET_FAKEBIN"
+for tool in curl nc wget ssh buzz; do
+  cat > "$NET_FAKEBIN/$tool" <<'SH'
+#!/usr/bin/env bash
+printf '%s %s\n' "${0##*/}" "$*" >> "${NET_MARKER:?NET_MARKER unset}"
+printf 'network tool %s was invoked by a readiness probe\n' "${0##*/}" >&2
+exit 97
+SH
+  chmod +x "$NET_FAKEBIN/$tool"
+done
+
+test_buzz_probe_fails_closed_with_no_client_configured() {
+  local home="$TMP_ROOT/probe-unconfigured" marker="$TMP_ROOT/probe-unconfigured.net"
+  mkdir -p "$home/config"
+  run 0 "probe with no buzz-client file" \
+    env PATH="$NET_FAKEBIN:$BASE_PATH" NET_MARKER="$marker" FM_HOME="$home" "$CLI" probe buzz
+  assert_equals "buzz/unconfigured" "$OUT" "an absent buzz-client must read as unconfigured"
+  assert_absent "$marker" "the probe must not invoke curl, nc, wget, ssh or buzz"
+  # And that outcome must be the one the chain acts on.
+  write_config "$home" "$BUZZ_CHAIN"
+  run 0 "the probed outcome drives the chain" env FM_HOME="$home" "$CLI" next buzz unconfigured
+  assert_equals "fallback:agent-mail" "$OUT" "an unconfigured probe advances the chain"
+  pass "with no client configured the probe reports buzz/unconfigured and performs no network action"
+}
+
+test_buzz_probe_fails_closed_on_every_unusable_client() {
+  local home="$TMP_ROOT/probe-closed" marker="$TMP_ROOT/probe-closed.net"
+  mkdir -p "$home/config"
+  : > "$home/config/buzz-client"
+  run 0 "blank buzz-client" \
+    env PATH="$NET_FAKEBIN:$BASE_PATH" NET_MARKER="$marker" FM_HOME="$home" "$CLI" probe buzz
+  assert_equals "buzz/unconfigured" "$OUT" "a blank buzz-client is unconfigured"
+  printf '   \n\n' > "$home/config/buzz-client"
+  run 0 "whitespace-only buzz-client" \
+    env PATH="$NET_FAKEBIN:$BASE_PATH" NET_MARKER="$marker" FM_HOME="$home" "$CLI" probe buzz
+  assert_equals "buzz/unconfigured" "$OUT" "a whitespace-only buzz-client is unconfigured"
+  printf '%s\n' "$TMP_ROOT/no-such-buzz-client" > "$home/config/buzz-client"
+  run 0 "buzz-client naming an absent path" \
+    env PATH="$NET_FAKEBIN:$BASE_PATH" NET_MARKER="$marker" FM_HOME="$home" "$CLI" probe buzz
+  assert_equals "buzz/unconfigured" "$OUT" "a named-but-absent client is unconfigured"
+  printf '%s\n' "$home/config/buzz-client" > "$home/config/buzz-client"
+  run 0 "buzz-client naming a non-executable" \
+    env PATH="$NET_FAKEBIN:$BASE_PATH" NET_MARKER="$marker" FM_HOME="$home" "$CLI" probe buzz
+  assert_equals "buzz/unconfigured" "$OUT" "a non-executable client is unconfigured"
+  assert_absent "$marker" "no unusable-client path may invoke a network tool"
+  pass "every unusable buzz client fails closed to unconfigured, never to ok"
+}
+
+test_buzz_probe_reports_configured_without_running_the_client() {
+  local home="$TMP_ROOT/probe-configured" marker="$TMP_ROOT/probe-configured.net"
+  local client="$TMP_ROOT/probe-configured.client" ran="$TMP_ROOT/probe-configured.ran"
+  mkdir -p "$home/config"
+  cat > "$client" <<'SH'
+#!/usr/bin/env bash
+printf 'ran %s\n' "$*" >> "${BUZZ_RAN:?}"
+exit 0
+SH
+  chmod +x "$client"
+  printf '%s\n' "$client" > "$home/config/buzz-client"
+  run 0 "probe with an executable client" \
+    env PATH="$NET_FAKEBIN:$BASE_PATH" NET_MARKER="$marker" BUZZ_RAN="$ran" FM_HOME="$home" "$CLI" probe buzz
+  assert_equals "buzz/configured" "$OUT" "an executable client reads as configured"
+  assert_absent "$ran" "a readiness probe must never execute the client"
+  assert_absent "$marker" "a readiness probe must never invoke a network tool"
+  pass "a present executable client reads as configured without being run"
+}
+
+test_probe_refuses_an_adapter_it_cannot_answer_for() {
+  local home="$TMP_ROOT/probe-refuse"
+  mkdir -p "$home/config"
+  local adapter
+  for adapter in native agent-mail fm-send; do
+    run 2 "probe $adapter" env FM_HOME="$home" "$CLI" probe "$adapter"
+    assert_contains "$OUT" "has no readiness probe in this fork" "$adapter refusal names the absence"
+  done
+  run 2 "probe an unknown adapter" env FM_HOME="$home" "$CLI" probe smoke-signal
+  assert_contains "$OUT" "is not one of native, buzz, agent-mail, fm-send" "an unknown adapter is named"
+  run 2 "probe with no home named" env -u FM_HOME -u FM_CONFIG_OVERRIDE "$CLI" probe buzz
+  assert_contains "$OUT" "FM_HOME is unset" "the probe refuses to guess a home"
+  pass "the probe refuses an adapter it cannot answer for, rather than reporting a readiness"
+}
+
+test_probe_reads_the_config_override_dir() {
+  local home="$TMP_ROOT/probe-home" other="$TMP_ROOT/probe-override"
+  mkdir -p "$home/config" "$other"
+  printf '%s\n' /bin/sh > "$other/buzz-client"
+  run 0 "FM_CONFIG_OVERRIDE selects the probe's config dir" \
+    env FM_HOME="$home" FM_CONFIG_OVERRIDE="$other" "$CLI" probe buzz
+  assert_equals "buzz/configured" "$OUT" "the override dir's buzz-client wins"
+  pass "the probe resolves buzz-client through FM_CONFIG_OVERRIDE like every other config read"
+}
+
 # --- required backend: fail closed instead of markdown -----------------------------------------
 
 make_home() {  # <name> -> prints the home; single-home layout with a markdown backlog
@@ -431,6 +597,16 @@ test_deadline_is_acceptance_plus_configured_timeout
 test_templated_dispatch_passes
 test_bare_slash_command_is_refused
 test_dispatch_without_skill_or_ack_is_refused
+test_the_fleet_seeded_buzz_chain_is_valid_and_ordered
+test_buzz_next_step_rows_mirror_agent_mail
+test_buzz_has_no_sent_outcome
+test_an_unknown_adapter_is_still_refused_naming_the_field
+test_a_chain_may_declare_buzz_without_agent_mail
+test_buzz_probe_fails_closed_with_no_client_configured
+test_buzz_probe_fails_closed_on_every_unusable_client
+test_buzz_probe_reports_configured_without_running_the_client
+test_probe_refuses_an_adapter_it_cannot_answer_for
+test_probe_reads_the_config_override_dir
 test_required_beads_refuses_a_markdown_home
 test_required_beads_passes_through_when_beads_resolves
 test_required_beads_refuses_manual_editing
