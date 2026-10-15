@@ -191,6 +191,30 @@ test_stage_refuses_invalid_input_before_any_change() {
   pass "every invalid stage refuses with exit 2 and writes nothing"
 }
 
+# The chief registry names every VP <session>@<host> (ai-harness AIH-3l8fm), and the
+# chief stages and claims with that exact string. A broker that refuses "@" refuses
+# every registered VP, so the form is pinned end to end here: stage, claim through
+# the gate, and a second claim on another route gets only the receipt.
+test_a_session_at_host_vp_id_stages_and_claims() {
+  local home db
+  home=$(new_home session-at-host)
+  db="$home/dispatch-bodies.sqlite3"
+  run 0 "stage for aih-9@sem-kg-ec2" python3 "$BROKER" --db "$db" stage --dispatch-id cos-at-1 \
+    --vp-id aih-9@sem-kg-ec2 --owner-machine-key mk-1 --owner-epoch 0 --chief-generation 0 \
+    --staged-by-machine-key mk-1 --created-at "$STAGED_AT" --expires-at "$DEADLINE_AT" --body-file "$BODY_FILE"
+  assert_equals aih-9@sem-kg-ec2 "$(json receipt.vp_id)" "the receipt keeps the registry vp_id verbatim"
+  run 2 "claim by the bare session name" "$RECEIVE" --db "$db" --dispatch-id cos-at-1 --vp-id aih-9 --route native
+  assert_contains "$OUT" "target-mismatch" "the host part is part of the identity"
+  run 0 "claim as aih-9@sem-kg-ec2" "$RECEIVE" --db "$db" --dispatch-id cos-at-1 --vp-id aih-9@sem-kg-ec2 --route native
+  assert_equals "$BODY_SHA" "$(body_sha_of_json)" "the addressed VP receives the body"
+  run 4 "second claim on agent-mail" "$RECEIVE" --db "$db" --dispatch-id cos-at-1 --vp-id aih-9@sem-kg-ec2 --route agent-mail
+  assert_not_contains "$OUT" "invoke your /next" "the loser gets no body"
+  run 2 "@ in a dispatch id" stage "$db" "cos@at" --body-file "$BODY_FILE"
+  assert_contains "$OUT" "dispatch_id" "only vp_id admits @; a dispatch id names a file and stays narrow"
+  run 2 "vp_id starting with @" stage "$db" cos-at-2 --vp-id "@sem-kg-ec2" --body-file "$BODY_FILE"
+  pass "a <session>@<host> vp_id stages and claims; dispatch ids still refuse @"
+}
+
 test_no_home_is_refused_not_guessed() {
   run 2 "no db, no FM_HOME" env -u FM_HOME -u FM_DISPATCH_BODY_DB python3 "$BROKER" receipt --dispatch-id cos-1
   assert_contains "$OUT" "never guessed" "the refusal says the database is never guessed"
@@ -501,6 +525,7 @@ PY
 test_stage_commits_a_private_database_and_a_verifiable_hash
 test_stage_is_idempotent_for_same_content_and_a_conflict_otherwise
 test_stage_refuses_invalid_input_before_any_change
+test_a_session_at_host_vp_id_stages_and_claims
 test_no_home_is_refused_not_guessed
 test_unowned_or_shared_database_is_refused
 test_first_claim_wins_the_body_and_later_routes_get_the_receipt
