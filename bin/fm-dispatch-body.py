@@ -64,6 +64,10 @@ ROUTES = ("native", "buzz", "agent-mail", "fm-send")
 STATES = ("staged", "claimed", "reconcile-required", "injected", "terminal", "expired")
 RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 IDENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
+# A vp_id also admits "@": the chief registry names every VP <session>@<host>
+# (ai-harness AIH-3l8fm) and stages and claims with that exact string. A dispatch
+# id keeps IDENT, because it names the winner's inbox projection file.
+VP_IDENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}$")
 
 EXIT_OK, EXIT_REFUSED, EXIT_CONFLICT, EXIT_RECEIPT = 0, 2, 3, 4
 
@@ -125,6 +129,12 @@ def now_ts(explicit):
 def check_ident(field, value):
     if not isinstance(value, str) or not IDENT.match(value):
         raise Refusal(EXIT_REFUSED, f"{field}: must be 1-200 chars of [A-Za-z0-9._:/-] starting alphanumeric, got {value!r}")
+    return value
+
+
+def check_vp_id(value):
+    if not isinstance(value, str) or not VP_IDENT.match(value):
+        raise Refusal(EXIT_REFUSED, f"vp_id: must be 1-200 chars of [A-Za-z0-9._:/@-] starting alphanumeric, got {value!r}")
     return value
 
 
@@ -279,7 +289,7 @@ def cmd_stage(args):
     record = {
         "schema_version": SCHEMA_VERSION,
         "dispatch_id": check_ident("dispatch_id", args.dispatch_id),
-        "vp_id": check_ident("vp_id", args.vp_id),
+        "vp_id": check_vp_id(args.vp_id),
         "owner_machine_key": check_ident("owner_machine_key", args.owner_machine_key),
         "owner_epoch": check_uint("owner_epoch", args.owner_epoch),
         "chief_generation": check_uint("chief_generation", args.chief_generation),
@@ -356,7 +366,7 @@ def _write_inbox_projection(inbox_dir, receipt):
 
 def cmd_claim(args):
     dispatch_id = check_ident("dispatch_id", args.dispatch_id)
-    vp_id = check_ident("vp_id", args.vp_id)
+    vp_id = check_vp_id(args.vp_id)
     route = check_route(args.route)
     expected = check_hash("expected_hash", args.expected_hash)
     now = now_ts(args.now)
