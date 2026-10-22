@@ -496,14 +496,14 @@ observe() { # canonical GitHub URL -> normalized JSON
     wait_forges "$comments_pid" "$events_pid" || return 1
     jq -e 'type == "array" and all(.[]; type == "array")' "$TMP/comments.json" >/dev/null \
       || unobserved 'comment pages returned an unexpected shape' || return 1
-    jq -n --slurpfile timeline "$TMP/issue-events.json" --arg label "$label" --slurpfile core "$TMP/core.json" --slurpfile comments "$TMP/comments.json" '
+    jq -n --slurpfile timeline "$TMP/issue-events.json" --arg ready_label "$label" --slurpfile core "$TMP/core.json" --slurpfile comments "$TMP/comments.json" '
       $core[0] as $c | {state:$c.state,head:null,
-        ready:any($c.labels[]; (.name | ascii_downcase) == ($label | ascii_downcase)),
+        ready:any($c.labels[]; (.name | ascii_downcase) == ($ready_label | ascii_downcase)),
         checks:[],reviews:[],events:($comments[0] | add // []
           | map(select(.user.login != $c.user.login and (.author_association | IN("OWNER","MEMBER","COLLABORATOR")))
             | {token:("comment:" + (.id|tostring) + ":" + (.updated_at // "")),type:"comment",source:.html_url,
                head:null,author:.user.login,body:(.body // "" | .[:500])})
-          + [$timeline[0][] | .[] | select(.event == "labeled" and (.label.name | ascii_downcase) == ($label | ascii_downcase))
+          + [$timeline[0][] | .[] | select(.event == "labeled" and (.label.name | ascii_downcase) == ($ready_label | ascii_downcase))
              | {token:("ready-for-pr:" + (.id | tostring)),type:"ready-for-pr",source:$c.html_url,head:null,body:"filed issue reached ready-for-pr"}])}' > "$TMP/observation.json" \
       || unobserved 'observation could not be assembled' || return 1
   fi
