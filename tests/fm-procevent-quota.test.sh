@@ -192,6 +192,12 @@ out=$(FM_HOME="$LAB/retire-home" FM_STATE_OVERRIDE="$LAB/retire-state" \
 [ "$out" = "retired: quota-codex" ] || fail "provider retire targeted the wrong source: $out"
 ok "provider retire resolves the armed source id"
 
+out=$(umask 002; FM_HOME="$LAB/retire-umask-home" FM_STATE_OVERRIDE="$LAB/retire-umask-state" \
+  "$BIN/fm-procevent-quota.sh" retire --provider codex 2>&1) \
+  || fail "retire under a group-writable umask refused its own fresh state root: $out"
+[ "$out" = "retired: quota-codex" ] || fail "retire under a group-writable umask returned: $out"
+ok "a fresh state root stays private under a group-writable umask"
+
 if err=$(QUOTA_AXI_COUNT="$COUNT" PATH="$FAKEBIN:$PATH" "$BIN/fm-procevent-quota.sh" poll --interval 1 --threshold 100.5 --provider codex --timeout 1 2>&1); then
   fail "threshold above 100 unexpectedly started polling"
 fi
