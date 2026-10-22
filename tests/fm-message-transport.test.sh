@@ -259,6 +259,7 @@ test_next_without_a_loaded_policy_is_refused() {
   assert_contains "$OUT" "missing or unreadable" "next fails closed on an unloadable policy"
   run 2 "next with no home named" env -u FM_HOME -u FM_CONFIG_OVERRIDE "$CLI" next native refused
   assert_contains "$OUT" "FM_HOME is unset" "next refuses to guess a home"
+  # shellcheck disable=SC2016 # Expansion is deliberately deferred to the child shell.
   run 2 "library next before any load" bash -c \
     '. "$1"; fm_mt_next native refused; rc=$?; printf "%s\n" "$FM_MT_ERROR"; exit "$rc"' \
     _ "$ROOT/bin/fm-message-transport-lib.sh"
@@ -293,6 +294,7 @@ invoked /next, run id cos-dispatch-1, outcome <ok|blocked|declined>'
 test_templated_dispatch_passes() {
   run 0 "templated dispatch" "$CLI" check-dispatch "$GOOD_DISPATCH"
   assert_equals ok "$OUT" "templated dispatch prints ok"
+  # shellcheck disable=SC2016 # Expansion is deliberately deferred to the child shell.
   run 0 "templated dispatch via stdin" bash -c 'printf "%s" "$1" | "$2" check-dispatch -' _ "$GOOD_DISPATCH" "$CLI"
   assert_equals ok "$OUT" "stdin form prints ok"
   pass "a templated dispatch (skill named, ack line quoted) passes the gate"
