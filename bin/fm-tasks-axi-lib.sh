@@ -303,6 +303,7 @@ fm_tasks_axi_required_backend_check() {  # <config-dir> <tasks-axi-working-direc
     return 2
   fi
   if ! fm_tasks_axi_compatible; then
+    # shellcheck disable=SC2034 # Output global, read by the sourcing caller.
     FM_TASKS_AXI_REQUIRED_ERROR="config/backlog-backend-required=$required needs tasks-axi ${FM_TASKS_AXI_MIN} or newer with the $required adapter on PATH; tasks-axi is missing or incompatible, and there is no manual fallback for this home"
     return 2
   fi
