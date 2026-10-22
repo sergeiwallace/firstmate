@@ -122,7 +122,7 @@ refuse() {  # <status> <message>
 # FM_HOME to be set, which this planner deliberately does not, so the two
 # non-existent-tail-safe lines live here instead.
 physical_path() {  # <path>
-  local p=$1 rest= base
+  local p=$1 rest='' base
   [ -n "$p" ] || return 1
   case "$p" in
     /*) ;;
@@ -484,7 +484,7 @@ if [ "$BACKLOG_RC" -ne 0 ] || [ -z "$BACKLOG_OUT" ]; then
 else
   # The listing travels in the environment, not on stdin: stdin carries the
   # program, exactly as the other python3 steps in this file do.
-  OWNERSHIP=$(FM_VP_MIGRATE_BACKLOG_JSON="$BACKLOG_OUT" python3 - "$VP" 2>&1 <<'PY'
+  if ! OWNERSHIP=$(FM_VP_MIGRATE_BACKLOG_JSON="$BACKLOG_OUT" python3 - "$VP" 2>&1 <<'PY'
 import json, os, re, sys
 
 WRAPPERS = ("tasks", "rows", "items", "entries", "backlog")
@@ -549,8 +549,7 @@ for row in rows:
             break
 print("%d %d %d %d" % (owned, active, owner_rows, mentions))
 PY
-  )
-  if [ $? -ne 0 ]; then
+  ); then
     fail_gate beads-ownership "fm-tasks-axi.sh list --json returned something this cannot read, so ownership is unknown rather than empty: $OWNERSHIP"
     finish
   fi

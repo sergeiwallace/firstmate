@@ -168,7 +168,9 @@ fm_mt_load() {
       else
         FM_MT_FALLBACKS=${3//,/ }
       fi
+      # shellcheck disable=SC2034 # Output global, read by the sourcing caller.
       FM_MT_OFFLINE_TIMEOUT=$4
+      # shellcheck disable=SC2034 # Output global, read by the sourcing caller.
       FM_MT_ACTIVATION_TIMEOUT=$5
       return 0
       ;;
@@ -223,7 +225,7 @@ fm_mt_classify() {
     native/offline-timeout) FM_MT_CLASS=advance; FM_MT_DETAIL=native-timeout ;;
     native/activation-timeout) FM_MT_CLASS=advance; FM_MT_DETAIL=native-activation-timeout ;;
     native/unresolved|native/refused|native/denied|native/expired) FM_MT_CLASS=advance ;;
-    native/claimed) FM_MT_CLASS=done ;;
+    native/claimed) FM_MT_CLASS='done' ;;
     native/ambiguous) FM_MT_CLASS=stop; FM_MT_DETAIL=reconcile ;;
     # Buzz mirrors Agent Mail's outcome vocabulary exactly: it is a store-and-
     # forward relay with the same four dispositions, so it needs no row Agent
@@ -233,13 +235,13 @@ fm_mt_classify() {
     # advances to the next declared adapter instead of stalling the chain.
     buzz/unconfigured|buzz/cancelled|buzz/expired) FM_MT_CLASS=advance ;;
     buzz/pending) FM_MT_CLASS=pending; FM_MT_DETAIL=buzz ;;
-    buzz/receipt|buzz/claimed) FM_MT_CLASS=done ;;
+    buzz/receipt|buzz/claimed) FM_MT_CLASS='done' ;;
     buzz/ambiguous) FM_MT_CLASS=stop; FM_MT_DETAIL=reconcile ;;
     agent-mail/unconfigured|agent-mail/cancelled|agent-mail/expired) FM_MT_CLASS=advance ;;
     agent-mail/pending) FM_MT_CLASS=pending; FM_MT_DETAIL=agent-mail ;;
-    agent-mail/receipt|agent-mail/claimed) FM_MT_CLASS=done ;;
+    agent-mail/receipt|agent-mail/claimed) FM_MT_CLASS='done' ;;
     agent-mail/ambiguous) FM_MT_CLASS=stop; FM_MT_DETAIL=reconcile ;;
-    fm-send/sent|fm-send/claimed) FM_MT_CLASS=done ;;
+    fm-send/sent|fm-send/claimed) FM_MT_CLASS='done' ;;
     # Possibly delivered: stop and read the pane rather than resend.
     fm-send/inconclusive) FM_MT_CLASS=stop; FM_MT_DETAIL=verify-pane ;;
     fm-send/failed) FM_MT_CLASS=advance ;;
@@ -269,7 +271,7 @@ fm_mt_classify() {
 # No loaded policy, an adapter the chain does not declare, an unknown adapter,
 # or an unknown outcome: status 2 with FM_MT_ERROR.
 fm_mt_next() {
-  local transport=$1 outcome=$2 chain successor= seen=0 t
+  local transport=$1 outcome=$2 chain successor='' seen=0 t
   FM_MT_ERROR=
   if [ -z "$FM_MT_PRIMARY" ]; then
     FM_MT_ERROR="policy: load the transport config before asking for the next step"
@@ -436,6 +438,7 @@ fm_mt_check_dispatch() {
     return 1
   fi
   if ! printf '%s\n' "$trimmed" | grep -Fq 'invoked /'; then
+    # shellcheck disable=SC2034 # Output global, read by the sourcing caller.
     FM_MT_ERROR="dispatch: missing the required ack line ('invoked /<skill>, run id <dispatch-id>, outcome <ok|blocked|declined>'); silence would be indistinguishable from refusal"
     return 1
   fi
