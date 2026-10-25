@@ -22,7 +22,30 @@ live_lab_cleanup() {
   for marker in "$TMP_ROOT/orphan-child" "$TMP_ROOT/late-child" "$TMP_ROOT/reused-child"; do
     [ ! -s "$marker" ] || printf '%s\n' "$(<"$marker")" >> "$TMP_ROOT/pids"
   done
-  while read -r pid; do [ -n "$pid" ] && { pkill -P "$pid" 2>/dev/null || true; kill "$pid" 2>/dev/null || true; }; done < "$TMP_ROOT/pids"
+  local start entry left n
+  local -a signalled=()
+  while read -r pid; do
+    [ -n "$pid" ] || continue
+    start=$(ps -o lstart= -p "$pid" 2>/dev/null | awk '{$1=$1; print}')
+    pkill -P "$pid" 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true
+    [ -n "$start" ] && signalled+=("$pid=$start")
+  done < "$TMP_ROOT/pids"
+  # Some fixtures ignore TERM by design, and down deliberately spares a few of them, so TERM
+  # alone leaves them running for minutes (AIH-i4tq6i). Wait briefly, then KILL only a pid whose
+  # start time is unchanged since it was signalled, so a reused pid is never touched.
+  for ((n = 0; n < 20; n++)); do
+    left=0
+    for entry in ${signalled[@]+"${signalled[@]}"}; do
+      [ "$(ps -o lstart= -p "${entry%%=*}" 2>/dev/null | awk '{$1=$1; print}')" = "${entry#*=}" ] && left=1
+    done
+    [ "$left" = 0 ] && break
+    sleep 0.1
+  done
+  for entry in ${signalled[@]+"${signalled[@]}"}; do
+    [ "$(ps -o lstart= -p "${entry%%=*}" 2>/dev/null | awk '{$1=$1; print}')" = "${entry#*=}" ] \
+      && kill -KILL "${entry%%=*}" 2>/dev/null
+  done
   while read -r dir; do
     [ -n "$dir" ] || continue
     [ -d "$dir" ] || continue
