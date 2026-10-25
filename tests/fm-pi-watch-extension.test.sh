@@ -6,6 +6,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-pi-watch-extension)
+fm_test_measure_orphan_reaper
 EXT="$ROOT/.pi/extensions/fm-primary-pi-watch.ts"
 # Node 24 warns when these test-only dynamic imports load tracked ESM plugins
 # from a clean checkout with no tracked .opencode/package.json. The warning is
@@ -4354,7 +4355,7 @@ EOF
     kill -KILL "$poller" 2>/dev/null || true
     fail "the process-group reap left the failed case's poller pid $poller running"
   fi
-  out=$(ps -eo ppid=,args= 2>/dev/null | awk -v root="$repo/" '$1 == 1 && index($0, root)')
+  out=$(ps -eo ppid=,args= 2>/dev/null | awk -v root="$repo/" -v r="$FM_TEST_ORPHAN_REAPER" '($1 == 1 || $1 == r) && index($0, root)')
   [ -z "$out" ] || fail "orphans from the failed case survived the reap: $out"
   pass "Pi teardown reaps a failed case's orphaned poller as a process group"
 }
@@ -4364,7 +4365,7 @@ EOF
 test_pi_suite_leaves_no_orphaned_processes() {
   local out
   pi_reap_process_groups
-  out=$(ps -eo ppid=,args= 2>/dev/null | awk -v root="$TMP_ROOT/" '$1 == 1 && index($0, root)')
+  out=$(ps -eo ppid=,args= 2>/dev/null | awk -v root="$TMP_ROOT/" -v r="$FM_TEST_ORPHAN_REAPER" '($1 == 1 || $1 == r) && index($0, root)')
   [ -z "$out" ] || fail "processes from this suite's temporary root outlived the teardown reap: $out"
   pass "Pi suite leaves no orphaned process from its temporary root"
 }

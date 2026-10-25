@@ -383,6 +383,21 @@ trap 'fm_test_cleanup; exit 131' QUIT
 # from real (non-test) firstmate commands. The marker identifies the owning
 # shell across PID reuse, so the same live owner always wins over the age
 # fallback for dead or unowned roots.
+# The pid that adopts this test run's orphans. It is init on a host without a
+# child subreaper, but a user-session manager such as `systemd --user` is one
+# and adopts first, so a test must never assume pid 1. Measured once by
+# orphaning a probe, then exported so fixture scripts inherit it (AIH-kwfcdy).
+fm_test_measure_orphan_reaper() {
+  [ -n "${FM_TEST_ORPHAN_REAPER:-}" ] && return 0
+  local probe reaper
+  probe=$(bash -c 'sleep 30 </dev/null >/dev/null 2>&1 & printf "%s\n" "$!"')
+  reaper=$(ps -o ppid= -p "$probe" 2>/dev/null | tr -d ' ')
+  kill "$probe" 2>/dev/null || true
+  case "$reaper" in '' | *[!0-9]*) reaper=1 ;; esac
+  FM_TEST_ORPHAN_REAPER=$reaper
+  export FM_TEST_ORPHAN_REAPER
+}
+
 FM_TEST_ORPHAN_MAX_AGE_SECONDS=${FM_TEST_ORPHAN_MAX_AGE_SECONDS:-3600}
 
 fm_test_reap_orphans() {
