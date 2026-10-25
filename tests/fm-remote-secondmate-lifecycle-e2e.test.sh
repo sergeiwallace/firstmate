@@ -48,7 +48,9 @@ cleanup() {
     . "$ROOT/bin/fm-remote-job-lib.sh"
     fm_remote_job_stop_worker_tree "$worker_pid" || true
   fi
-  rm -rf -- "$TMP_ROOT"
+  # fm-spawn leaves its git-hooks strip directory read-only on a failed spawn;
+  # a raw rm cannot clear it, so a failed run leaked its tree (AIH-uly5em).
+  fm_test_remove_tree "$TMP_ROOT"
 }
 trap cleanup EXIT
 
