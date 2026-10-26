@@ -42,16 +42,40 @@ pass "disposable watcher refuses inherited state outside its marked lab"
 drain_and_ack() {  # <state>
   local state=$1 err sequence generation
   err="$state/.test-drain.err"
-  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || return 1
+  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || { drain_state_dump "$state" "drain failed"; return 1; }
   sequence=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$err")
   generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$err")
+  if [ -z "$sequence" ] || [ -z "$generation" ]; then
+    drain_state_dump "$state" "drain printed no WAKE_ACK_REQUIRED line"
+    rm -f "$err"
+    return 1
+  fi
   rm -f "$err"
-  [ -n "$sequence" ] && [ -n "$generation" ] || return 1
   FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
     --recovery-generation "$generation"
 }
 
-# rearm_after_retained_cleanup <state> <fakebin> <armerr> <armout>
+# drain_state_dump <state> <why>: print-only. When drain_and_ack fails, show the
+# drain's stderr and who holds the watch and downtime-marker locks, so a red run
+# names the state it failed in.
+drain_state_dump() {
+  local state=$1 why=$2 path pid
+  printf 'drain_and_ack: %s\n' "$why" >&2
+  sed 's/^/drain_and_ack: drain stderr: /' "$state/.test-drain.err" >&2 2>/dev/null || true
+  for path in "$state/.watch.lock" "$state/.watcher-down.lock"; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      pid=$(cat "$path/pid" 2>/dev/null || true)
+      printf 'drain_and_ack: %s link=%s pid=%s alive=%s cmd=%s\n' "${path##*/}" \
+        "$(readlink "$path" 2>/dev/null || echo -)" "${pid:--}" \
+        "$([ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo yes || echo no)" \
+        "$([ -n "$pid" ] && ps -o args= -p "$pid" 2>/dev/null | cut -c1-200)" >&2
+    else
+      printf 'drain_and_ack: %s absent\n' "${path##*/}" >&2
+    fi
+  done
+}
+
+# rearm_after_retained_cleanup <state> <fakebin> <armerr> <armout> [VAR=value...]
 #
 # An interrupted watcher whose EXIT cleanup cannot take state/.watcher-down.lock
 # within FM_WATCHER_CLEANUP_LOCK_BOUND keeps its dead-pid lock "for the next arm to
@@ -59,9 +83,12 @@ drain_and_ack() {  # <state>
 # published, so a drain straight after it has nothing to acknowledge. When <armerr>
 # shows that branch, run that next arm and require it to resurface the recovery,
 # then let the caller drain. It also names whatever holds the marker lock at that
-# moment, so a passing run still records the contender. Otherwise a no-op.
+# moment, so a passing run still records the contender. Any VAR=value arguments
+# reach the next arm too, so it runs with the same settings as the interrupted one.
+# Otherwise a no-op.
 rearm_after_retained_cleanup() {
   local state=$1 fakebin=$2 armerr=$3 armout=$4 lock pid alive age cmd arm i
+  shift 4
   grep -qF 'watcher: recovery state could not be persisted; retaining stale lock evidence' "$armerr" \
     || return 0
   lock="$state/.watcher-down.lock"
@@ -77,7 +104,7 @@ rearm_after_retained_cleanup() {
   printf 'watcher-lock: retained cleanup, marker-lock holder at re-arm: present=%s link=%s pid=%s alive=%s age=%s cmd=%s\n' \
     "$([ -e "$lock" ] || [ -L "$lock" ] && echo yes || echo no)" "$(readlink "$lock" 2>/dev/null || echo -)" \
     "${pid:--}" "$alive" "$age" "${cmd:--}" >&2
-  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
+  env PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$@" "$WATCH_ARM" > "$armout" &
   arm=$!
   i=0
   while [ "$i" -lt 80 ] && is_live_non_zombie "$arm"; do
@@ -1336,7 +1363,7 @@ SH
 
   rm -f "$check_file" "$state/task.check-trust"
   armout="$dir/successor-arm.out"
-  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WATCH_PREDECESSOR_ARM_PID="$first_arm" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WATCH_PREDECESSOR_ARM_PID="$first_arm" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" 2> "$dir/successor-arm.err" &
   successor_arm=$!
   i=0
   while [ "$i" -lt 80 ]; do
@@ -1350,6 +1377,9 @@ SH
     || fail "predecessor ledger record was not linked to its verified successor"
   kill -HUP "$successor_arm" 2>/dev/null || true
   wait "$successor_arm" 2>/dev/null || true
+  cat "$dir/successor-arm.err" >&2
+  # A cleanup that could not take the marker lock leaves recovery to the next arm.
+  rearm_after_retained_cleanup "$state" "$fakebin" "$dir/successor-arm.err" "$dir/successor-rearm.out"
   # The forced interruption is a watcher-down interval. Consume the prior
   # delivered wake before beginning independent ledger cycles, just as the
   # recovery handling turn does, so this fixture does not intentionally carry a
@@ -1361,7 +1391,7 @@ SH
   iteration=0
   while [ "$iteration" -lt 6 ]; do
     armout="$dir/bounded-$iteration.out"
-    PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WATCH_CYCLE_LOG_MAX_BYTES=1400 FM_WATCH_CYCLE_LOG_KEEP_LINES=2 FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
+    PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WATCH_CYCLE_LOG_MAX_BYTES=1400 FM_WATCH_CYCLE_LOG_KEEP_LINES=2 FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" 2> "$dir/bounded-$iteration.err" &
     successor_arm=$!
     i=0
     while [ "$i" -lt 80 ]; do
@@ -1372,6 +1402,9 @@ SH
     grep -qF 'watcher: started pid=' "$armout" || fail "bounded ledger cycle $iteration did not start"
     kill -HUP "$successor_arm" 2>/dev/null || true
     wait "$successor_arm" 2>/dev/null || true
+    cat "$dir/bounded-$iteration.err" >&2
+    rearm_after_retained_cleanup "$state" "$fakebin" "$dir/bounded-$iteration.err" "$dir/bounded-$iteration.rearm.out" \
+      FM_WATCH_CYCLE_LOG_MAX_BYTES=1400 FM_WATCH_CYCLE_LOG_KEEP_LINES=2
     drain_and_ack "$state" \
       || fail "recovery drain after bounded ledger cycle $iteration failed"
     iteration=$((iteration + 1))
