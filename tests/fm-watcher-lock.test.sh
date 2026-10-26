@@ -1462,6 +1462,9 @@ test_retained_cleanup_recovers_through_the_next_arm() {
   # Prove the case reached the state it is about before judging the recovery.
   grep -qF 'watcher: recovery state could not be persisted; retaining stale lock evidence' "$armerr" \
     || fail "the interrupted watcher's cleanup did not hit the contended marker lock: $(cat "$armerr")"
+  # The retain branch names who held the marker lock, so a red run elsewhere says so.
+  grep -qE "^watcher: retained cleanup: transition=release-lock bound=1 .* last_try_holder=$holder marker_lock=present pid=$holder alive=yes\$" "$armerr" \
+    || fail "the retained cleanup did not name the marker-lock holder ($holder): $(cat "$armerr")"
   lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
   [ -n "$lock_pid" ] || fail "the retained cleanup did not keep its watch lock as evidence"
   ! kill -0 "$lock_pid" 2>/dev/null || fail "the retained watch lock names a live pid ($lock_pid)"
