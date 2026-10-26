@@ -1222,6 +1222,26 @@ test_native_effort_validator_keeps_axes_separate() {
   pass "native effort validator checks harness and model as separate axes"
 }
 
+test_spawn_case_refuses_a_reused_name() {
+  local first second rc
+  first=$(make_spawn_case reused-case claude reused-case 2>&1)
+  expect_code 0 "$?" "first spawn case failed to build: $first"
+  second=$(make_spawn_case reused-case claude reused-case 2>&1)
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "a second spawn case under one name was built: $second"
+  assert_contains "$second" "spawn case name already used: reused-case" "a reused case name did not fail loudly"
+  pass "a spawn case name used twice in one run fails loudly"
+}
+
+test_empty_case_record_stops_before_any_write() {
+  local out
+  out=$( (read_case_record ""; printf 'reached\n') 2>&1 )
+  expect_code 1 "$?" "an empty case record did not stop the case: $out"
+  assert_not_contains "$out" "reached" "the case continued past an empty case record"
+  assert_contains "$out" "empty spawn case record" "an empty case record did not say why it stopped"
+  pass "an empty case record stops the case before it writes anything"
+}
+
 test_native_pi_ultra_is_explicit_and_model_scoped() {
   local rec id out launch harness mode native_profile model
   for harness in pi pi-signed; do
@@ -2637,6 +2657,8 @@ test_opencode2_delivery_gate_fails_when_turn_never_starts
 test_opencode1_launch_has_no_delivery_gate
 test_opencode_busy_plugin_provisioned_for_every_major
 test_native_effort_validator_keeps_axes_separate
+test_spawn_case_refuses_a_reused_name
+test_empty_case_record_stops_before_any_write
 test_native_pi_ultra_is_explicit_and_model_scoped
 test_batch_preserves_native_ultra
 test_pi_scout_launch_enters_recorded_worktree
