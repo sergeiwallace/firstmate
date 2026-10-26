@@ -3417,6 +3417,20 @@ pr_poll_publish_release() {
   PR_POLL_PUBLISH_LOCK=
 }
 
+# Print-only: when the EXIT cleanup retains its lock, name the transition, how long
+# it waited for the downtime-marker lock against its bound, the holder recorded by
+# the last failed lock try (empty when the try failed with no live holder, or the
+# lock was taken and a later step failed), and who holds the marker lock now.
+watcher_cleanup_retain_detail() {  # <transition> <start EPOCHREALTIME> <start SECONDS>
+  local lock="${WATCHER_DOWNTIME_MARKER}.lock" pid
+  pid=$(cat "$lock/pid" 2>/dev/null || true)
+  printf 'watcher: retained cleanup: transition=%s bound=%s real=%s..%s seconds=%s..%s last_try_holder=%s marker_lock=%s pid=%s alive=%s\n' \
+    "$1" "${CLEANUP_LOCK_BOUND:--}" "${2:--}" "${EPOCHREALTIME:--}" "$3" "$SECONDS" \
+    "${FM_LOCK_HELD_PID:--}" \
+    "$([ -e "$lock" ] || [ -L "$lock" ] && echo present || echo absent)" "${pid:--}" \
+    "$([ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo yes || echo no)" >&2
+}
+
 watcher_cleanup() {
   local cleanup_status=0 owns_lock=0 transition=release-lock
   pr_poll_publish_release || cleanup_status=1
@@ -3435,11 +3449,14 @@ watcher_cleanup() {
   fm_capture_output_cleanup
   fm_wait_tmp_cleanup
   fm_custom_check_snapshot_cleanup
-  if [ "$owns_lock" -eq 1 ] \
-    && ! fm_recovery_transition "$WATCHER_DOWNTIME_MARKER" "$transition" "$WATCH_LOCK" \
+  if [ "$owns_lock" -eq 1 ]; then
+    local started_real=${EPOCHREALTIME:-} started_seconds=$SECONDS
+    if ! fm_recovery_transition "$WATCHER_DOWNTIME_MARKER" "$transition" "$WATCH_LOCK" \
       downtime "$CLEANUP_LOCK_BOUND"; then
-    echo "watcher: recovery state could not be persisted; retaining stale lock evidence" >&2
-    cleanup_status=1
+      echo "watcher: recovery state could not be persisted; retaining stale lock evidence" >&2
+      watcher_cleanup_retain_detail "$transition" "$started_real" "$started_seconds"
+      cleanup_status=1
+    fi
   fi
   return "$cleanup_status"
 }
