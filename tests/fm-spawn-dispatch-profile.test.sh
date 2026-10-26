@@ -87,6 +87,9 @@ make_spawn_case() {
   local name=$1 harness=$2 case_dir home proj wt fakebin launchlog id
   shift 2
   case_dir="$TMP_ROOT/$name"
+  # A case dir is built once per run. A second case under one name would reuse it
+  # and its wt-<name> branch, and its git setup fails without stopping the case.
+  [ ! -e "$case_dir" ] || fail "spawn case name already used: $name ($case_dir exists)"
   home="$case_dir/home"
   proj="$case_dir/project"
   wt="$case_dir/wt"
@@ -152,9 +155,16 @@ run_ship_spawn() {
 }
 
 read_case_record() {
+  # make_spawn_case runs in a command substitution, so a failed setup reaches the
+  # case only as an empty record. Stop here, before any path is used for a write.
+  [ -n "$1" ] || fail "empty spawn case record: make_spawn_case failed"
   IFS='|' read -r CASE_DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR LAUNCH_LOG <<EOF
 $1
 EOF
+  local field
+  for field in "$CASE_DIR" "$HOME_DIR" "$PROJ_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG"; do
+    [ -n "$field" ] || fail "incomplete spawn case record: $1"
+  done
 }
 
 assert_meta_profile() {
@@ -1243,7 +1253,7 @@ test_empty_case_record_stops_before_any_write() {
 }
 
 test_native_pi_ultra_is_explicit_and_model_scoped() {
-  local rec id out launch harness mode native_profile model
+  local rec id out launch harness mode native_profile model n=0
   for harness in pi pi-signed; do
     for mode in no-mistakes direct-PR; do
       id="ultra-$harness-$mode"
@@ -1260,7 +1270,7 @@ test_native_pi_ultra_is_explicit_and_model_scoped() {
     done
   done
   for native_profile in 'claude:codex-native/gpt-6-astra' 'codex:codex-native/gpt-6-astra' 'pi:openai-codex/gpt-6-astra' 'pi:default' 'pi:codex-native/'; do
-    harness=${native_profile%%:*}; model=${native_profile#*:}; id="ultra-refused-$RANDOM"
+    n=$((n + 1)); harness=${native_profile%%:*}; model=${native_profile#*:}; id="ultra-refused-$n"
     rec=$(make_spawn_case "$id" "$harness" "$id")
     read_case_record "$rec"
     out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
