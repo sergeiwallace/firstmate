@@ -42,13 +42,79 @@ pass "disposable watcher refuses inherited state outside its marked lab"
 drain_and_ack() {  # <state>
   local state=$1 err sequence generation
   err="$state/.test-drain.err"
-  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || return 1
+  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || { drain_state_dump "$state" "drain failed"; return 1; }
   sequence=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$err")
   generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$err")
+  if [ -z "$sequence" ] || [ -z "$generation" ]; then
+    drain_state_dump "$state" "drain printed no WAKE_ACK_REQUIRED line"
+    rm -f "$err"
+    return 1
+  fi
   rm -f "$err"
-  [ -n "$sequence" ] && [ -n "$generation" ] || return 1
   FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
     --recovery-generation "$generation"
+}
+
+# drain_state_dump <state> <why>: print-only. When drain_and_ack fails, show the
+# drain's stderr and who holds the watch and downtime-marker locks, so a red run
+# names the state it failed in.
+drain_state_dump() {
+  local state=$1 why=$2 path pid
+  printf 'drain_and_ack: %s\n' "$why" >&2
+  sed 's/^/drain_and_ack: drain stderr: /' "$state/.test-drain.err" >&2 2>/dev/null || true
+  for path in "$state/.watch.lock" "$state/.watcher-down.lock"; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      pid=$(cat "$path/pid" 2>/dev/null || true)
+      printf 'drain_and_ack: %s link=%s pid=%s alive=%s cmd=%s\n' "${path##*/}" \
+        "$(readlink "$path" 2>/dev/null || echo -)" "${pid:--}" \
+        "$([ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo yes || echo no)" \
+        "$([ -n "$pid" ] && ps -o args= -p "$pid" 2>/dev/null | cut -c1-200)" >&2
+    else
+      printf 'drain_and_ack: %s absent\n' "${path##*/}" >&2
+    fi
+  done
+}
+
+# rearm_after_retained_cleanup <state> <fakebin> <armerr> <armout> [VAR=value...]
+#
+# An interrupted watcher whose EXIT cleanup cannot take state/.watcher-down.lock
+# within FM_WATCHER_CLEANUP_LOCK_BOUND keeps its dead-pid lock "for the next arm to
+# republish and clear" (docs/watcher-continuity.md); no downtime marker is
+# published, so a drain straight after it has nothing to acknowledge. When <armerr>
+# shows that branch, run that next arm and require it to resurface the recovery,
+# then let the caller drain. It also names whatever holds the marker lock at that
+# moment, so a passing run still records the contender. Any VAR=value arguments
+# reach the next arm too, so it runs with the same settings as the interrupted one.
+# Otherwise a no-op.
+rearm_after_retained_cleanup() {
+  local state=$1 fakebin=$2 armerr=$3 armout=$4 lock pid alive age cmd arm i
+  shift 4
+  grep -qF 'watcher: recovery state could not be persisted; retaining stale lock evidence' "$armerr" \
+    || return 0
+  lock="$state/.watcher-down.lock"
+  pid=$(cat "$lock/pid" 2>/dev/null || true)
+  alive=no; cmd=-; age=-
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    alive=yes
+    cmd=$(ps -o args= -p "$pid" 2>/dev/null | cut -c1-200)
+  fi
+  if [ -e "$lock" ] || [ -L "$lock" ]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$lock" 2>/dev/null || date +%s) ))s
+  fi
+  printf 'watcher-lock: retained cleanup, marker-lock holder at re-arm: present=%s link=%s pid=%s alive=%s age=%s cmd=%s\n' \
+    "$([ -e "$lock" ] || [ -L "$lock" ] && echo yes || echo no)" "$(readlink "$lock" 2>/dev/null || echo -)" \
+    "${pid:--}" "$alive" "$age" "${cmd:--}" >&2
+  env PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$@" "$WATCH_ARM" > "$armout" &
+  arm=$!
+  i=0
+  while [ "$i" -lt 80 ] && is_live_non_zombie "$arm"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  is_live_non_zombie "$arm" && fail "the next arm did not surface recovery after a retained cleanup"
+  wait "$arm" 2>/dev/null || true
+  grep -F 'check: rearm-resurface' "$armout" >/dev/null \
+    || fail "the next arm reclaimed the dead-pid lock without surfacing recovery: $(cat "$armout")"
 }
 
 test_wait_deadline_reaps_a_stopped_child() {
@@ -1297,7 +1363,7 @@ SH
 
   rm -f "$check_file" "$state/task.check-trust"
   armout="$dir/successor-arm.out"
-  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WATCH_PREDECESSOR_ARM_PID="$first_arm" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WATCH_PREDECESSOR_ARM_PID="$first_arm" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" 2> "$dir/successor-arm.err" &
   successor_arm=$!
   i=0
   while [ "$i" -lt 80 ]; do
@@ -1311,6 +1377,9 @@ SH
     || fail "predecessor ledger record was not linked to its verified successor"
   kill -HUP "$successor_arm" 2>/dev/null || true
   wait "$successor_arm" 2>/dev/null || true
+  cat "$dir/successor-arm.err" >&2
+  # A cleanup that could not take the marker lock leaves recovery to the next arm.
+  rearm_after_retained_cleanup "$state" "$fakebin" "$dir/successor-arm.err" "$dir/successor-rearm.out"
   # The forced interruption is a watcher-down interval. Consume the prior
   # delivered wake before beginning independent ledger cycles, just as the
   # recovery handling turn does, so this fixture does not intentionally carry a
@@ -1322,7 +1391,7 @@ SH
   iteration=0
   while [ "$iteration" -lt 6 ]; do
     armout="$dir/bounded-$iteration.out"
-    PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WATCH_CYCLE_LOG_MAX_BYTES=1400 FM_WATCH_CYCLE_LOG_KEEP_LINES=2 FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
+    PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WATCH_CYCLE_LOG_MAX_BYTES=1400 FM_WATCH_CYCLE_LOG_KEEP_LINES=2 FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" 2> "$dir/bounded-$iteration.err" &
     successor_arm=$!
     i=0
     while [ "$i" -lt 80 ]; do
@@ -1333,6 +1402,9 @@ SH
     grep -qF 'watcher: started pid=' "$armout" || fail "bounded ledger cycle $iteration did not start"
     kill -HUP "$successor_arm" 2>/dev/null || true
     wait "$successor_arm" 2>/dev/null || true
+    cat "$dir/bounded-$iteration.err" >&2
+    rearm_after_retained_cleanup "$state" "$fakebin" "$dir/bounded-$iteration.err" "$dir/bounded-$iteration.rearm.out" \
+      FM_WATCH_CYCLE_LOG_MAX_BYTES=1400 FM_WATCH_CYCLE_LOG_KEEP_LINES=2
     drain_and_ack "$state" \
       || fail "recovery drain after bounded ledger cycle $iteration failed"
     iteration=$((iteration + 1))
@@ -1342,6 +1414,59 @@ SH
   ! grep -v '^arm_pid=.*watcher_pid=.*started_at=.*ended_at=.*exit_code=.*signal=.*reason=.*beacon_age=.*lock_before=.*lock_after=.*successor=' "$state/.watch-cycle-exits.log" | grep . >/dev/null \
     || fail "bounded lifecycle ledger contains a partial or malformed record"
   pass "cycle-exit ledger links a verified successor and remains size-capped"
+}
+
+test_retained_cleanup_recovers_through_the_next_arm() {
+  # An interrupted watcher's EXIT cleanup bounds its wait for the downtime-marker
+  # lock with FM_WATCHER_CLEANUP_LOCK_BOUND. On timeout it keeps its dead-pid lock
+  # "for the next arm to republish and clear" and publishes no downtime marker
+  # (docs/watcher-continuity.md). Recreate that on purpose: a separate live process
+  # holds .watcher-down.lock across the HUP for longer than the bound, then lets it
+  # go. The cleanup must take that branch, keep the dead-pid lock, and the next arm
+  # must resurface the recovery so a drain can acknowledge it.
+  local dir state fakebin armout armerr arm holder held lock_pid i
+  dir=$(make_case cleanup-marker-contended)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  armerr="$dir/arm.err"
+  held="$dir/holder.held"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WATCHER_CLEANUP_LOCK_BOUND=1 FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" 2> "$armerr" &
+  arm=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$armout" || fail "contended-cleanup watcher did not start"
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_acquire_wait "$2" || exit 1
+    : > "$3"
+    sleep 4
+    fm_lock_release "$2"
+  ' _ "$LIB" "$state/.watcher-down.lock" "$held" &
+  holder=$!
+  i=0
+  while [ "$i" -lt 80 ] && [ ! -e "$held" ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$held" ] || fail "foreign holder never took the downtime-marker lock"
+  kill -HUP "$arm" 2>/dev/null || true
+  wait "$arm" 2>/dev/null || true
+  wait "$holder" || fail "foreign holder could not release the downtime-marker lock"
+  # Prove the case reached the state it is about before judging the recovery.
+  grep -qF 'watcher: recovery state could not be persisted; retaining stale lock evidence' "$armerr" \
+    || fail "the interrupted watcher's cleanup did not hit the contended marker lock: $(cat "$armerr")"
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  [ -n "$lock_pid" ] || fail "the retained cleanup did not keep its watch lock as evidence"
+  ! kill -0 "$lock_pid" 2>/dev/null || fail "the retained watch lock names a live pid ($lock_pid)"
+  rearm_after_retained_cleanup "$state" "$fakebin" "$armerr" "$dir/next-arm.out"
+  drain_and_ack "$state" \
+    || fail "drain after the next arm resurfaced a retained cleanup's recovery failed"
+  pass "a retained cleanup keeps its dead-pid lock and the next arm resurfaces recovery for the drain"
 }
 
 test_stopped_watcher_is_live_but_stale_then_exit_is_classified() {
@@ -1606,4 +1731,5 @@ test_arm_propagates_immediate_wake_before_confirmation
 test_arm_waits_for_peer_beacon_after_child_stands_down
 test_arm_fails_loud_when_no_fresh_watcher_confirmable
 test_cycle_exit_ledger_links_successor_and_stays_bounded
+test_retained_cleanup_recovers_through_the_next_arm
 test_stopped_watcher_is_live_but_stale_then_exit_is_classified
