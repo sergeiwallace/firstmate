@@ -442,24 +442,33 @@ test_lock_steals_dead_pid_lock() {
 # Start a process that claims each given link lock, then SIGKILL it so every
 # claim is left behind with a dead owner - an acquirer TERMed mid-steal.
 leave_dead_link_locks() {  # <state> <lock>...
-  local state=$1 holder i last
+  local state=$1 holder i ready
   shift
-  last=${!#}
+  ready="$state.dead-link-owner.ready"
+  rm -f "$ready"
+  # Kill only after every claim has returned. The owner's pid file is
+  # non-empty from the prepare step, but fm_lock_claim truncates and rewrites
+  # it, so a kill keyed on "pid non-empty" can land mid-rewrite and leave an
+  # empty pid. The lock then rightly treats that fresh link as mid-acquire and
+  # refuses to reclaim it, which failed the dead-steal-owner case
+  # intermittently (rc=8).
   FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
-    shift
+    ready=$2
+    shift 2
     for lock do fm_lock_try_create "$lock" || exit 7; done
+    : > "$ready"
     exec sleep 30
-  ' _ "$LIB" "$@" >/dev/null 2>&1 &
+  ' _ "$LIB" "$ready" "$@" >/dev/null 2>&1 &
   holder=$!
   # A loaded serial shard can stall the holder's startup past a second; allow
   # the same ~5s as this file's other child-startup waits.
   i=0
-  while [ "$i" -lt 250 ] && [ ! -s "$last/pid" ]; do
+  while [ "$i" -lt 250 ] && [ ! -e "$ready" ]; do
     sleep 0.02
     i=$((i + 1))
   done
-  [ -s "$last/pid" ] || fail "dead link-lock owner did not publish its pid"
+  [ -e "$ready" ] || fail "dead link-lock owner did not finish claiming its locks"
   kill -KILL "$holder" 2>/dev/null || true
   wait "$holder" 2>/dev/null || true
 }
