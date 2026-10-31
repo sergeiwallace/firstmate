@@ -57,9 +57,9 @@ mkdir -p "$temp/.cortex-plugin" "$temp/hooks"
 jq -n --arg id "$ID" \
   '{name: "firstmate-worker", version: "1.0.0", description: ("firstmate lifecycle hooks for task " + $id)}' \
   > "$temp/.cortex-plugin/plugin.json"
-jq -n --arg start "$start" --arg submit "$submit" --arg stop "$stop" --arg end "$end" '
+jq -n --arg start "$start" --arg submit "$submit" --arg stop "$stop" --arg session_end "$end" '
   def hook($cmd): [{matcher: "*", hooks: [{type: "command", command: $cmd, timeout: 10}]}];
-  {hooks: {SessionStart: hook($start), UserPromptSubmit: hook($submit), Stop: hook($stop), SessionEnd: hook($end)}}
+  {hooks: {SessionStart: hook($start), UserPromptSubmit: hook($submit), Stop: hook($stop), SessionEnd: hook($session_end)}}
 ' > "$temp/hooks/hooks.json"
 rm -rf "$final"
 mv "$temp" "$final"
