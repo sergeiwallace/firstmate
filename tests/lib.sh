@@ -199,6 +199,51 @@ FM_TEST_OWNER_IDENTITY=$(fm_test_pid_identity "$$") || {
   return 1
 }
 
+# Captured child PIDs need their own finalizer: argv-based fixture discovery
+# cannot find a disowned `sleep` whose only fixture association is its cwd.
+# Birth identity survives exec, but refuses a reused PID.
+FM_TEST_PID_REGISTRY=$(mktemp "$FM_TEST_TMPDIR/.fm-test-pids.$$.XXXXXX") || return 1
+
+fm_test_pid_start_time() {
+  FM_STATE_OVERRIDE="$FM_TEST_TMPDIR" bash -c \
+    '. "$1"; fm_pid_start_time "$2"' _ "$ROOT/bin/fm-wake-lib.sh" "$1"
+}
+
+fm_test_track_pid() {  # <pid>, immediately after spawning a child
+  local pid=$1 identity
+  case "$pid" in ''|*[!0-9]*|0|1) return 1 ;; esac
+  [ "$pid" != "$$" ] || return 1
+  identity=$(fm_test_pid_start_time "$pid") || return 1
+  printf '%s\t%s\n' "$pid" "$identity" >> "$FM_TEST_PID_REGISTRY"
+}
+
+fm_test_reap_pids() {
+  local pid expected live i
+  [ -f "$FM_TEST_PID_REGISTRY" ] || return 0
+  while IFS=$'\t' read -r pid expected; do
+    [ -n "$pid" ] && [ -n "$expected" ] || continue
+    live=$(fm_test_pid_start_time "$pid" 2>/dev/null) || live=
+    if [ -n "$live" ]; then
+      if [ "$live" != "$expected" ]; then
+        printf 'refusing to signal changed fixture pid %s\n' "$pid" >&2
+        continue
+      fi
+      kill -TERM "$pid" 2>/dev/null || true
+      # Give a bounded child supervisor time to reap its own process group.
+      for ((i=0; i<30; i++)); do
+        kill -0 "$pid" 2>/dev/null || break
+        case "$(ps -o stat= -p "$pid" 2>/dev/null)" in ''|*Z*) break ;; esac
+        sleep 0.1
+      done
+      live=$(fm_test_pid_start_time "$pid" 2>/dev/null) || live=
+      if [ -n "$live" ] && [ "$live" = "$expected" ]; then
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+    fi
+    wait "$pid" 2>/dev/null || true
+  done < "$FM_TEST_PID_REGISTRY"
+}
+
 # --- process-event runner reaping -------------------------------------------
 #
 # A process-event runner is detached into its own process group and reparents to
@@ -302,7 +347,9 @@ fm_test_remove_tree() {
   if [ -d "$dir" ] && [ ! -L "$dir" ]; then
     find "$dir" -type d -exec chmod u+rwx {} + 2>/dev/null || true
   fi
-  rm -rf "$dir"
+  if [ -e "$dir" ] || [ -L "$dir" ]; then
+    rm -r -- "$dir"
+  fi
 }
 
 # --- fixture-root process reaping -------------------------------------------
@@ -324,6 +371,13 @@ fm_test_reap_root_processes() {  # <root>
     chain="$chain$pid "
     pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
   done
+  # Explicit PID ownership wins over argv discovery, including a refused
+  # identity mismatch. Never let the fallback signal a registered replacement.
+  if [ -f "$FM_TEST_PID_REGISTRY" ]; then
+    while IFS=$'\t' read -r pid _; do
+      [ -z "$pid" ] || chain="$chain$pid "
+    done < "$FM_TEST_PID_REGISTRY"
+  fi
   for signal in TERM KILL; do
     i=0
     while [ "$i" -lt 20 ]; do
@@ -341,6 +395,7 @@ fm_test_reap_root_processes() {  # <root>
 
 fm_test_cleanup() {
   local d
+  fm_test_reap_pids
   fm_test_reap_watchers
   fm_test_reap_procevent_homes
   for d in "${FM_TEST_CLEANUP_DIRS[@]:-}"; do
@@ -354,6 +409,7 @@ fm_test_cleanup() {
     done < "$FM_TEST_CLEANUP_REGISTRY"
     rm -f "$FM_TEST_CLEANUP_REGISTRY"
   fi
+  [ ! -f "$FM_TEST_PID_REGISTRY" ] || rm -- "$FM_TEST_PID_REGISTRY"
 }
 
 fm_test_tmproot() {
@@ -364,7 +420,7 @@ fm_test_tmproot() {
   root=$(cd -P -- "$root" && pwd -P) || return 1
   if ! printf '%s\n%s\n' "$$" "$FM_TEST_OWNER_IDENTITY" > "$root/.fm-test-fixture" ||
     ! printf '%s\n' "$root" >> "$FM_TEST_CLEANUP_REGISTRY"; then
-    rm -rf "$root"
+    fm_test_remove_tree "$root"
     return 1
   fi
   printf '%s\n' "$root"

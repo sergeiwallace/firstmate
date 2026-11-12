@@ -10,7 +10,7 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-fm_live_gate opt-in FM_GROK_STOP_LIVE_E2E tmux jq
+fm_live_gate opt-in FM_GROK_STOP_LIVE_E2E tmux jq perl
 
 NATIVE_BIN=${FM_GROK_NATIVE_BIN:-}
 LEGACY_BIN=${FM_GROK_LEGACY_BIN:-}
@@ -26,54 +26,8 @@ ACTIVE_LAB=
 NATIVE_VERSION=$($NATIVE_BIN --version)
 LEGACY_VERSION=$($LEGACY_BIN --version)
 
-cleanup_exact_cell() {
-  local lab=$1 session=$2 target=$3 pane_expected pid_expected pane_live pid_live windows
-  pane_expected=$(sed -n 's/^target-pane=//p' "$lab/target.identity")
-  pid_expected=$(sed -n 's/^target-pid=//p' "$lab/target.identity")
-  [ -n "$pane_expected" ] && [ -n "$pid_expected" ] || {
-    echo "blocked: missing recorded target identity; preserving $lab" >&2
-    return 1
-  }
-  pane_live=$(cd "$lab" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S dedicated.sock \
-    display-message -p -t "$session:$target" '#{pane_id}' 2>/dev/null) || {
-      echo "blocked: cannot verify target pane identity; preserving $lab" >&2
-      return 1
-    }
-  pid_live=$(cd "$lab" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S dedicated.sock \
-    display-message -p -t "$session:$target" '#{pane_pid}' 2>/dev/null) || {
-      echo "blocked: cannot verify target process identity; preserving $lab" >&2
-      return 1
-    }
-  [ "$pane_live" = "$pane_expected" ] && [ "$pid_live" = "$pid_expected" ] || {
-    echo "blocked: live target identity differs from creation record; preserving $lab" >&2
-    return 1
-  }
-  FM_E2E_TMUX_SOCKET_ID="$lab/dedicated.sock" PATH="$lab/bin:$PATH" \
-    env -u TMUX -u TMUX_PANE "$lab/bin/tmux" kill-window -t "$session:$target" || return 1
-  windows=$(cd "$lab" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S dedicated.sock \
-    list-windows -t "$session" -F '#{window_name}') || return 1
-  printf '%s\n' "$windows" | grep -Fqx control || {
-    echo "blocked: control window did not survive exact target cleanup; preserving $lab" >&2
-    return 1
-  }
-  printf '%s\n' "$windows" | grep -Fqx "$target" && {
-    echo "blocked: exact target survived cleanup; preserving $lab" >&2
-    return 1
-  }
-  FM_E2E_TMUX_SOCKET_ID="$lab/dedicated.sock" PATH="$lab/bin:$PATH" \
-    env -u TMUX -u TMUX_PANE "$lab/bin/tmux" kill-server || return 1
-  rm -rf -- "$lab"
-  ACTIVE_LAB=
-}
-
-preserve_on_failure() {
-  local rc=$?
-  if [ "$rc" -ne 0 ] && [ -n "$ACTIVE_LAB" ]; then
-    echo "blocked: preserving failed isolated Grok cell at $ACTIVE_LAB" >&2
-  fi
-  exit "$rc"
-}
-trap preserve_on_failure EXIT
+# shellcheck source=tests/grok-stop-cell-helpers.sh
+. "$(dirname "${BASH_SOURCE[0]}")/grok-stop-cell-helpers.sh"
 
 run_cell() {  # <native|legacy> <exact-binary>
   local kind=$1 binary=$2 lab tmp_base session target prompt i child_count payload_count unique_sessions
@@ -83,9 +37,10 @@ run_cell() {  # <native|legacy> <exact-binary>
   lab=$(mktemp -d "$tmp_base/fm-grok-stop-$kind.XXXXXX") || return 1
   session="$kind-e2e"
   target="fm-$kind"
+  ACTIVE_TARGET=$target
   ACTIVE_LAB=$lab
   umask 077
-  mkdir -p "$lab"/{home,grok-home,bin,fmhome/state,fmhome/config}
+  mkdir -p "$lab"/{home,grok-home,bin,tmp,fmhome/state,fmhome/config}
   git clone -q --no-hardlinks "$ROOT" "$lab/project" || return 1
   # Before the candidate is committed, clone sees HEAD only. Apply the current
   # tracked diff so this opt-in gate always exercises the code under review.
@@ -147,25 +102,25 @@ EOF
   cat > "$lab/run.sh" <<EOF
 #!/usr/bin/env bash
 set -u
+export TMPDIR='$lab/tmp' FM_TEST_SKIP_ORPHAN_REAP=1
+. '$ROOT/tests/lib.sh'
+. '$ROOT/tests/grok-stop-cell-helpers.sh'
 cd '$lab/project' || exit 70
-env -u TMUX -u TMUX_PANE HOME='$lab/home' GROK_HOME='$lab/grok-home' GROK_AGENT=1 \
+run_cell_child '$lab' env -u TMUX -u TMUX_PANE HOME='$lab/home' GROK_HOME='$lab/grok-home' GROK_AGENT=1 \
   FM_HOME='$lab/fmhome' FM_ROOT_OVERRIDE='$lab/project' FM_GROK_E2E_ROOT='$lab' \
   FM_GROK_E2E_BIN='$binary' FM_E2E_TMUX_SOCKET_ID='$lab/dedicated.sock' PATH='$lab/bin':"\$PATH" \
   '$binary' $([ "$kind" = native ] && printf '%s' '--trust ')--always-approve --reasoning-effort low \
     --output-format json --leader-socket '$lab/leader.sock' -p $(printf '%q' "$prompt") \
-    > '$lab/outer.json' 2> '$lab/outer.err' &
-child=\$!
-printf 'child_pid=%s\n' "\$child" > '$lab/process.identity'
-pgid=\$(ps -o pgid= -p "\$child" 2>/dev/null | tr -d ' ')
-printf 'child_pgid=%s\n' "\$pgid" >> '$lab/process.identity'
-wait "\$child"; rc=\$?
+    > '$lab/outer.json' 2> '$lab/outer.err'
+rc=\$?
+fm_test_cleanup
+trap - EXIT
 printf 'rc=%s\n' "\$rc" > '$lab/done'
-sleep 1800
+exec sleep 1800
 EOF
   chmod +x "$lab/run.sh"
 
-  ( cd "$lab" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S dedicated.sock \
-      new-session -d -s "$session" -n control 'sleep 1800' ) || return 1
+  start_cell_server "$lab" "$session" || return 1
   ( cd "$lab" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S dedicated.sock \
       new-window -d -t "$session:" -n "$target" "$lab/run.sh" ) || return 1
   printf 'target-pane=%s\ntarget-pid=%s\n' \
@@ -209,7 +164,6 @@ EOF
   cleanup_exact_cell "$lab" "$session" "$target" || return 1
 }
 
-run_cell native "$NATIVE_BIN"
-run_cell legacy "$LEGACY_BIN"
-trap - EXIT
+run_cell native "$NATIVE_BIN" || exit $?
+run_cell legacy "$LEGACY_BIN" || exit $?
 echo "ok - Grok adaptive Stop real-process matrix passed with exact target cleanup and control-window survival"
