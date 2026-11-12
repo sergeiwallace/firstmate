@@ -82,6 +82,7 @@ test_failed_teardown_case_reaps_sleeper() {
     case_dir=$(mktemp -d "$TMP_ROOT/teardown.XXXXXX")
     rc=0
     CASE_DIR="$case_dir" bash -c '
+      FM_TEARDOWN_TEST_SOURCE_ONLY=1
       . "$1/tests/fm-teardown.test.sh"
       make_case() { mkdir -p "$CASE_DIR/wt"; printf "%s\n" "$CASE_DIR"; }
       write_meta() { :; }
@@ -202,6 +203,7 @@ test_teardown_siblings_unwind_safely() {
     case_dir=$(mktemp -d "$TMP_ROOT/sibling.XXXXXX")
     rc=0
     CASE_DIR="$case_dir" bash -c '
+      FM_TEARDOWN_TEST_SOURCE_ONLY=1
       . "$1/tests/fm-teardown.test.sh"
       make_case() {
         mkdir -p "$CASE_DIR/wt" "$CASE_DIR/fakebin" "$CASE_DIR/empty-path"

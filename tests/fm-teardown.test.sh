@@ -5325,6 +5325,12 @@ test_retained_sources_still_reach_the_ordinary_refusal() {
   pass "present required sources still reach the ordinary teardown refusal"
 }
 
+# fm-test-process-cleanup.test.sh sources this file for its fixture functions
+# and must not run the whole suite (the harness runs it as a script).
+if [ "${FM_TEARDOWN_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 test_teardown_preserves_opencode_busy_plugin_on_pool_return
 
 # Archive coverage uses the real teardown entry point over isolated homes.
