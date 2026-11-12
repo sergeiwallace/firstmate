@@ -3060,6 +3060,7 @@ SH
     fm_lock_release "$LOCK"
   ' &
   holder_pid=$!
+  fm_test_track_pid "$holder_pid" || fail "could not register lock holder cleanup"
   local waited=0
   while [ ! -e "$ready" ] && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
   [ -e "$ready" ] || fail "herdr-orphan-refusal: the contending lock holder never started"
@@ -3465,6 +3466,7 @@ SH
     fm_lock_release "$LOCK"
   ' &
   holder_pid=$!
+  fm_test_track_pid "$holder_pid" || fail "could not register lock holder cleanup"
   while [ ! -e "$ready" ] && [ "$waited" -lt 50 ]; do
     sleep 0.1
     waited=$((waited + 1))
@@ -4666,6 +4668,7 @@ test_parked_own_run_refuses_when_abort_is_unconfirmed() {
   head=$(git -C "$case_dir/wt" rev-parse HEAD)
   ( cd "$case_dir/wt" && exec sleep 300 ) &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   disown
 
   cat > "$case_dir/fakebin/treehouse" <<EOF
@@ -4690,7 +4693,7 @@ EOF
   assert_absent "$case_dir/treehouse.log" \
     "parked-run-abort-unconfirmed: teardown returned the worktree after refusing"
   kill -0 "$pid" 2>/dev/null || fail "parked-run-abort-unconfirmed: process reap ran before refusal"
-  kill -KILL "$pid" 2>/dev/null || true
+  fm_test_reap_pids
   pass "teardown refuses before reap or removal when a task-owned run remains parked"
 }
 
@@ -4748,6 +4751,7 @@ test_leaked_worktree_process_is_reaped() {
   # to once an unpatched teardown had already run).
   ( cd "$case_dir/wt" && exec sleep 300 ) &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   disown
   sleep 0.3
   kill -0 "$pid" 2>/dev/null || fail "leaked-process-reap: setup sleeper did not start"
@@ -4757,7 +4761,7 @@ test_leaked_worktree_process_is_reaped() {
 
   expect_code 0 "$rc" "leaked-process-reap: teardown should still succeed"
   if kill -0 "$pid" 2>/dev/null; then
-    kill -KILL "$pid" 2>/dev/null || true
+    fm_test_reap_pids
     fail "leaked-process-reap: leaked worktree process survived teardown"
   fi
   assert_grep "reaping leaked worktree process" "$case_dir/stderr" \
@@ -4775,6 +4779,7 @@ test_leaked_tasktmp_process_is_reaped() {
 
   ( cd "$case_dir/tasktmp" && exec sleep 300 ) &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   disown
   sleep 0.3
   kill -0 "$pid" 2>/dev/null || fail "leaked-tasktmp-reap: setup sleeper did not start"
@@ -4784,7 +4789,7 @@ test_leaked_tasktmp_process_is_reaped() {
 
   expect_code 0 "$rc" "leaked-tasktmp-reap: teardown should still succeed"
   if kill -0 "$pid" 2>/dev/null; then
-    kill -KILL "$pid" 2>/dev/null || true
+    fm_test_reap_pids
     fail "leaked-tasktmp-reap: leaked tasktmp process survived teardown"
   fi
   assert_grep "reaping leaked worktree process" "$case_dir/stderr" \
@@ -4803,6 +4808,7 @@ test_lsof_absent_reaps_tmux_process_group() {
 
   perl -e 'setpgrp(0, 0); chdir shift or die; exec "sleep", "300"' "$case_dir/wt" &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   disown
   sleep 0.3
   kill -0 "$pid" 2>/dev/null || fail "lsof-absent-process-group-reap: setup sleeper did not start"
@@ -4821,7 +4827,7 @@ EOF
 
   expect_code 0 "$rc" "lsof-absent-process-group-reap: teardown should succeed"
   if kill -0 "$pid" 2>/dev/null; then
-    kill -KILL "$pid" 2>/dev/null || true
+    fm_test_reap_pids
     fail "lsof-absent-process-group-reap: tmux process group survived teardown"
   fi
   assert_grep "reaping leaked worktree process group" "$case_dir/stderr" \
@@ -4864,6 +4870,7 @@ test_reused_pid_identity_is_not_force_killed() {
 
   perl -e '$SIG{TERM} = "IGNORE"; sleep 300' &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   disown
   sleep 0.2
   cat > "$case_dir/fakebin/lsof" <<EOF
@@ -4899,7 +4906,7 @@ SH
   if ! kill -0 "$pid" 2>/dev/null; then
     fail "reused-pid-identity: teardown force-killed a process whose start time changed"
   fi
-  kill -KILL "$pid" 2>/dev/null || true
+  fm_test_reap_pids
   pass "a reused pid with a different start time is never force-killed"
 }
 
@@ -4919,6 +4926,7 @@ test_exec_changed_process_is_still_reaped() {
       exec "perl", "-e", '\''$SIG{TERM} = "IGNORE"; sleep 300'\'';
     ' "$marker" "$done_flag" ) &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   disown
   sleep 0.2
   cat > "$case_dir/fakebin/ps" <<'SH'
@@ -4958,7 +4966,7 @@ SH
 
   if kill -0 "$pid" 2>/dev/null; then
     survived=1
-    kill -KILL "$pid" 2>/dev/null || true
+    fm_test_reap_pids
   fi
   expect_code 0 "$rc" "exec-changed-process: teardown should succeed"
   [ "$survived" -eq 0 ] || fail "exec-changed-process: exec-changed leaked process survived teardown"
@@ -4973,19 +4981,37 @@ test_process_spawned_during_grace_is_reaped_on_later_pass() {
   child_file="$case_dir/child.pid"
 
   ( cd "$case_dir/wt" && exec perl -e '
-      my $file = shift;
+      my ($file, $registry) = @ARGV;
       $SIG{TERM} = sub {
         my $child = fork();
         die "fork" unless defined $child;
         if (!$child) { exec "sleep", "300"; }
+        # Register birth identity before publishing the child or exiting the
+        # parent. The shell finalizer must also own this late-spawned sleeper.
+        # Same birth stamp as fm_test_pid_start_time: /proc field 22, else ps.
+        my $identity;
+        if (open my $probe, "<", "/proc/$child/stat") {
+          my $stat = <$probe>;
+          close $probe;
+          $stat =~ s/^.*\) //;
+          $identity = (split / /, $stat)[19];
+        } else {
+          $identity = `ps -o lstart= -p $child`;
+          chomp $identity;
+        }
+        die "identity probe" unless defined $identity && length $identity;
+        open my $owned, ">>", $registry or die "registry";
+        print {$owned} "$child\t$identity\n";
+        close $owned;
         open my $fh, ">", $file or die "open";
         print {$fh} "$child\n";
         close $fh;
         exit 0;
       };
       sleep 300;
-    ' "$child_file" ) &
+    ' "$child_file" "$FM_TEST_PID_REGISTRY" ) &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   disown
   sleep 0.2
 
@@ -4995,11 +5021,11 @@ test_process_spawned_during_grace_is_reaped_on_later_pass() {
   if [ -f "$child_file" ]; then child_pid=$(cat "$child_file"); fi
   if [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null; then
     child_survived=1
-    kill -KILL "$child_pid" 2>/dev/null || true
+    fm_test_reap_pids
   fi
   if kill -0 "$pid" 2>/dev/null; then
     parent_survived=1
-    kill -KILL "$pid" 2>/dev/null || true
+    fm_test_reap_pids
   fi
   expect_code 0 "$rc" "grace-spawn-convergence: teardown should converge"
   assert_present "$child_file" "grace-spawn-convergence: TERM handler did not spawn a child"
@@ -5092,6 +5118,7 @@ test_run_abort_precedes_process_reap_precedes_worktree_removal() {
 
   ( cd "$case_dir/wt" && exec sleep 300 ) &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   disown
   sleep 0.3
   kill -0 "$pid" 2>/dev/null || fail "abort-then-reap-then-remove-order: setup sleeper did not start"
@@ -5113,7 +5140,7 @@ EOF
   FM_FAKE_NM_ABORT_LOG="$abort_log" \
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 0 "$rc" "abort-then-reap-then-remove-order: teardown should still succeed"
-  kill -0 "$pid" 2>/dev/null && { kill -KILL "$pid" 2>/dev/null || true; }
+  kill -0 "$pid" 2>/dev/null && fm_test_reap_pids
 
   assert_present "$case_dir/order.log" \
     "abort-then-reap-then-remove-order: the destructive worktree return was never invoked"
@@ -5297,6 +5324,12 @@ test_retained_sources_still_reach_the_ordinary_refusal() {
     "retained-sources: the ordinary refusal was replaced"
   pass "present required sources still reach the ordinary teardown refusal"
 }
+
+# fm-test-process-cleanup.test.sh sources this file for its fixture functions
+# and must not run the whole suite (the harness runs it as a script).
+if [ "${FM_TEARDOWN_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
 
 test_teardown_preserves_opencode_busy_plugin_on_pool_return
 
