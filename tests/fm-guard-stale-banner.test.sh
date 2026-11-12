@@ -270,6 +270,7 @@ test_healthy_recovery_rearms_next_stale_episode() {
 
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_live_watcher "$dir" "$pid" || fail "could not record the live watcher for recovery"
   touch "$home/state/.last-watcher-beat"
   healthy=$(run_guard_case "$dir")
@@ -280,7 +281,7 @@ test_healthy_recovery_rearms_next_stale_episode() {
     "healthy recovery must clear the stale-banner marker"
 
   rm -f "$home/state/.last-watcher-beat"
-  rm -rf "$home/state/.watch.lock"
+  fm_test_remove_tree "$home/state/.watch.lock"
   out2=$(run_guard_case "$dir")
   [ "$(count_text "$out2" "WATCHER DOWN - SUPERVISION IS OFF")" -eq 1 ] \
     || fail "second stale episode did not re-print the full banner: $out2"
@@ -390,6 +391,7 @@ test_healthy_read_only_does_not_clear_marker() {
   before=$(cat "$marker")
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_live_watcher "$dir" "$pid" || fail "could not record the live watcher for read-only recovery"
   touch "$home/state/.last-watcher-beat"
   healthy=$(run_guard_case_read_only "$dir")
@@ -474,6 +476,7 @@ test_autoarm_long_handling_turn_stays_silent() {
   home=$(case_home "$dir")
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_aged_rewake_epoch "$home" "$pid"
   record_session_lock_pid "$home" "$pid"
   out=$(run_guard_case_autoarm "$dir")
@@ -496,6 +499,7 @@ test_autoarm_long_turn_requires_every_healthy_signal() {
     home=$(case_home "$dir")
     sleep 60 &
     pid=$!
+    fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
     record_aged_rewake_epoch "$home" "$pid"
     record_session_lock_pid "$home" "$pid"
     case "$case_name" in
@@ -523,6 +527,7 @@ test_autoarm_long_turn_requires_every_healthy_signal() {
       changed-lock)
         sleep 60 &
         replacement_pid=$!
+        fm_test_track_pid "$replacement_pid" || fail "could not register fixture process cleanup"
         record_session_lock_pid "$home" "$replacement_pid"
         ;;
       moved-recovery)
@@ -554,6 +559,7 @@ test_autoarm_open_claim_does_not_explain_stale_beacon() {
   home=$(case_home "$dir")
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   identity=$(fm_test_pid_identity "$pid") \
     || fail "could not compute the open-claim owner identity"
   [ -n "$identity" ] || fail "open-claim owner identity was empty"
@@ -576,6 +582,7 @@ test_autoarm_long_turn_does_not_silence_other_models() {
     home=$(case_home "$dir")
     sleep 60 &
     pid=$!
+    fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
     record_aged_rewake_epoch "$home" "$pid"
     record_session_lock_pid "$home" "$pid"
     if [ "$model" = extension ]; then
@@ -637,6 +644,7 @@ test_extension_handoff_with_live_session_is_healthy() {
   home=$(case_home "$dir")
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_pi_extension_session "$dir" "$pid" || fail "could not record the Pi extension session"
   touch "$home/state/.last-watcher-beat"
   out=$(run_guard_case_extension "$dir")
@@ -710,6 +718,7 @@ test_extension_handoff_with_empty_lock_is_healthy() {
   home=$(case_home "$dir")
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_pi_extension_session "$dir" "$pid" || fail "could not record the Pi extension session"
   mkdir -p "$home/state/.watch.lock"
   touch "$home/state/.last-watcher-beat"
@@ -732,6 +741,7 @@ test_extension_held_unhealthy_locks_stay_alarm() {
     home=$(case_home "$dir")
     sleep 60 &
     session_pid=$!
+    fm_test_track_pid "$session_pid" || fail "could not register fixture process cleanup"
     record_pi_extension_session "$dir" "$session_pid" \
       || fail "could not record the Pi extension session for $case_name"
     holder_pid=
@@ -743,6 +753,7 @@ test_extension_held_unhealthy_locks_stay_alarm() {
       *)
         sleep 60 &
         holder_pid=$!
+        fm_test_track_pid "$holder_pid" || fail "could not register fixture process cleanup"
         record_live_watcher "$dir" "$holder_pid" \
           || fail "could not record the watcher lock for $case_name"
         case "$case_name" in
@@ -810,6 +821,7 @@ test_extension_ownership_needs_every_signal() {
     home=$(case_home "$dir")
     sleep 60 &
     pid=$!
+    fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
     if [ "$(printf '%s' "$spec" | cut -d: -f2)" = dead ]; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
@@ -851,6 +863,7 @@ test_extension_stale_beacon_alarms_despite_live_session() {
   home=$(case_home "$dir")
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_pi_extension_session "$dir" "$pid" || fail "could not record the Pi extension session"
   out=$(FM_ROOT_OVERRIDE="$(case_root "$dir")" \
     FM_HOME="$home" \
@@ -874,6 +887,7 @@ test_extension_handoff_keeps_queued_wake_warning() {
   home=$(case_home "$dir")
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_pi_extension_session "$dir" "$pid" || fail "could not record the Pi extension session"
   touch "$home/state/.last-watcher-beat"
   printf '%s\n' "1700000000	1	signal	task	signal: crewmate needs a decision" > "$home/state/.wake-queue"
@@ -900,6 +914,7 @@ test_branch_actor_is_not_told_to_drain_queued_wakes() {
   home=$(case_home "$dir")
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_pi_extension_session "$dir" "$pid" || fail "could not record the Pi extension session"
   touch "$home/state/.last-watcher-beat"
   printf '%s\n' \
@@ -929,6 +944,7 @@ test_persistent_model_ignores_pi_extension_evidence() {
   home=$(case_home "$dir")
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_pi_extension_session "$dir" "$pid" || fail "could not record the Pi extension session"
   touch "$home/state/.last-watcher-beat"
   out=$(run_guard_case "$dir")
@@ -949,6 +965,7 @@ test_extension_live_watcher_is_healthy_without_ownership_evidence() {
   home=$(case_home "$dir")
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_live_watcher "$dir" "$pid" || fail "could not record the live watcher"
   touch "$home/state/.last-watcher-beat"
   out=$(run_guard_case_extension "$dir")
@@ -978,6 +995,7 @@ test_pi_harness_routes_itself_to_the_extension_model() {
     home=$(case_home "$dir")
     sleep 60 &
     pid=$!
+    fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
     record_pi_extension_session "$dir" "$pid" || fail "could not record the Pi extension session"
     touch "$home/state/.last-watcher-beat"
     out=$(env -u CLAUDECODE -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u GROK_AGENT -u FM_SUPERVISION_MODEL \
@@ -994,6 +1012,11 @@ test_pi_harness_routes_itself_to_the_extension_model() {
   done
   pass "fm-guard stale banner: Pi and pi-signed primaries route themselves to the extension model"
 }
+
+# Failure-unwind coverage sources the fixtures without running this suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
 
 test_first_stale_call_prints_full_banner
 test_full_banner_names_quiet_mode_when_active

@@ -15,6 +15,9 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-claude-stop-autoarm)
+# Nested fake sessions register their sleepers with the suite's EXIT finalizer.
+export FM_TEST_PID_REGISTRY
+export -f fm_test_track_pid fm_test_pid_start_time
 fm_git_identity fmtest fmtest@example.invalid
 
 FAKEBIN=$(fm_fakebin "$TMP_ROOT/fakebin")
@@ -258,6 +261,7 @@ run_autoarm_bg() {
         "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
       ' > "$out" 2>&1 &
   RUN_AUTOARM_BG_PID=$!
+  fm_test_track_pid "$RUN_AUTOARM_BG_PID" || fail "could not register background hook cleanup"
 }
 
 watcher_identity() {
@@ -333,8 +337,15 @@ test_inert_when_lock_held_by_other_harness() {
   write_arm_fixture "$dir" actionable
   # The trailing no-op keeps the fake harness process alive instead of allowing
   # bash to exec the final sleep into a non-harness process.
-  "$FAKE_CLAUDE" -c 'sleep 60; :' &
+  "$FAKE_CLAUDE" -c '
+    sleep 60 &
+    child=$!
+    fm_test_track_pid "$child" || exit 70
+    wait "$child"
+    :
+  ' &
   other=$!
+  fm_test_track_pid "$other" || fail "could not register fixture process cleanup"
   printf '%s\n' "$other" > "$dir/state/.lock"
   out=$(printf '%s\n' '{"session_id":"s"}' | FM_HOME="$dir" "$FAKE_CLAUDE" -c '"$FM_HOME/bin/fm-claude-stop-autoarm.sh"' 2>&1); status=$?
   owner_after=$(cat "$dir/state/.lock")
@@ -495,6 +506,7 @@ test_actionable_close_with_live_successor_rewakes_once() {
   write_arm_fixture "$dir" actionable
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   identity=$(watcher_identity "$dir" "$pid") || fail "could not identify live successor for actionable close"
   record_watcher_lock "$dir" "$pid" "$identity"
   touch "$dir/state/.last-watcher-beat"
@@ -666,6 +678,7 @@ test_benign_cycle_end_with_live_watcher_is_silent() {
   write_arm_fixture "$dir" benign-live
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   identity=$(watcher_identity "$dir" "$pid") || fail "could not identify live watcher holder for benign close"
   record_watcher_lock "$dir" "$pid" "$identity"
   touch "$dir/state/.last-watcher-beat"
@@ -695,6 +708,7 @@ test_positive_recovery_budget_contention_preserves_episode() {
   write_arm_fixture "$dir" benign-live
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   identity=$(watcher_identity "$dir" "$pid") || fail "could not identify live watcher holder for recovery contention"
   record_watcher_lock "$dir" "$pid" "$identity"
   touch "$dir/state/.last-watcher-beat"
@@ -702,6 +716,7 @@ test_positive_recovery_budget_contention_preserves_episode() {
   : > "$dir/state/.claude-autoarm-failure-notified"
   sleep 60 &
   holder=$!
+  fm_test_track_pid "$holder" || fail "could not register fixture process cleanup"
   mkdir -p "$dir/state/.turnend-claude-blocks.lock"
   printf '%s\n' "$holder" > "$dir/state/.turnend-claude-blocks.lock/pid"
   out=$(run_autoarm "$dir" 2>/dev/null); status=$?
@@ -731,6 +746,7 @@ test_owner_mutex_contention_preserves_failure_episode_reset() {
   write_arm_fixture "$dir" reset-boundary
   sleep 60 &
   watcher=$!
+  fm_test_track_pid "$watcher" || fail "could not register fixture process cleanup"
   watcher_id=$(watcher_identity "$dir" "$watcher") || fail "could not identify reset-contention watcher"
   record_watcher_lock "$dir" "$watcher" "$watcher_id"
   touch "$dir/state/.last-watcher-beat"
@@ -755,6 +771,7 @@ test_owner_mutex_contention_preserves_failure_episode_reset() {
   done
   sleep 60 &
   holder=$!
+  fm_test_track_pid "$holder" || fail "could not register fixture process cleanup"
   mkdir -p "$dir/state/.claude-autoarm.lock"
   printf '%s\n' "$holder" > "$dir/state/.claude-autoarm.lock/pid"
   : > "$dir/state/arm-release"
@@ -767,7 +784,7 @@ test_owner_mutex_contention_preserves_failure_episode_reset() {
   kill "$holder" "$watcher" 2>/dev/null || true
   wait "$holder" 2>/dev/null || true
   wait "$watcher" 2>/dev/null || true
-  rm -rf "$dir/state/.claude-autoarm.lock"
+  fm_test_remove_tree "$dir/state/.claude-autoarm.lock"
   pass "auto-arm: owner-mutex contention preserves successor episode state"
 }
 
@@ -913,6 +930,7 @@ test_abandoned_owner_claim_is_reclaimed_and_rearms() {
   write_arm_fixture "$dir" actionable
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_autoarm_owner "$dir" "$pid"
   record_autoarm_epoch "$dir" 464 "$pid" rewake
   out=$(run_autoarm "$dir" 2>/dev/null); status=$?
@@ -940,6 +958,7 @@ test_abandoned_claim_reclaim_reaps_dead_steal_without_nesting() {
   write_arm_fixture "$dir" actionable
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_autoarm_owner "$dir" "$pid"
   record_autoarm_epoch "$dir" 464 "$pid" rewake
   FM_STATE_OVERRIDE="$dir/state" bash -c '
@@ -948,6 +967,7 @@ test_abandoned_claim_reclaim_reaps_dead_steal_without_nesting() {
     exec sleep 30
   ' _ "$dir/bin/fm-wake-lib.sh" "$dir/state/.claude-autoarm.lock.steal" >/dev/null 2>&1 &
   holder=$!
+  fm_test_track_pid "$holder" || fail "could not register lock holder cleanup"
   i=0
   while [ "$i" -lt 50 ] && [ ! -s "$dir/state/.claude-autoarm.lock.steal/pid" ]; do
     sleep 0.02
@@ -986,6 +1006,7 @@ test_arming_claim_with_fresh_beacon_is_never_reclaimed() {
   write_arm_fixture "$dir" actionable
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_autoarm_owner "$dir" "$pid"
   # An owner foregrounds the arm for the whole watcher cycle, so an old "arming"
   # entry is still in progress while its watcher keeps beating the beacon.
@@ -1012,6 +1033,7 @@ test_fresh_arming_claim_with_stale_beacon_is_never_reclaimed() {
   write_arm_fixture "$dir" actionable
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_autoarm_owner "$dir" "$pid"
   record_autoarm_owner_identity "$dir" "$pid" || fail "could not record a claim pid-identity"
   printf 'epoch=464 owner_pid=%s outcome=arming updated_at=%s\n' "$pid" "$(date +%s)" \
@@ -1034,6 +1056,7 @@ test_claim_not_named_by_the_ledger_is_never_reclaimed() {
   write_arm_fixture "$dir" actionable
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_autoarm_owner "$dir" "$pid"
   # A fresh claimant holds the lock before it writes "arming", so until it does
   # the ledger still names the PREVIOUS owner. Requiring the two pids to match is
@@ -1064,6 +1087,7 @@ test_pid_reused_arming_claim_is_reclaimed_and_rearms() {
   write_arm_fixture "$dir" actionable
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_autoarm_owner "$dir" "$pid"
   record_autoarm_owner_identity "$dir" "$$" || fail "could not record a claim pid-identity"
   record_autoarm_epoch "$dir" 464 "$pid" arming
@@ -1091,6 +1115,7 @@ test_pid_reused_claim_with_no_ledger_is_reclaimed_and_rearms() {
   write_arm_fixture "$dir" actionable
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_autoarm_owner "$dir" "$pid"
   record_autoarm_owner_identity "$dir" "$$" || fail "could not record a claim pid-identity"
   assert_absent "$dir/state/.claude-autoarm-epoch" "this case must start with no ledger at all"
@@ -1116,6 +1141,7 @@ test_identity_matched_arming_claim_is_never_reclaimed() {
   write_arm_fixture "$dir" actionable
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_autoarm_owner "$dir" "$pid"
   record_autoarm_owner_identity "$dir" "$pid" || fail "could not record a claim pid-identity"
   record_autoarm_epoch "$dir" 464 "$pid" arming
@@ -1138,6 +1164,7 @@ test_terminal_check_claim_is_never_reclaimed() {
   write_arm_fixture "$dir" actionable
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   # The synchronous guard takes the same lock under its own role while it decides
   # the attended fail-open. Reclaiming that would race the guard's own decision.
   record_autoarm_owner "$dir" "$pid" terminal-check
@@ -1162,6 +1189,7 @@ test_stuck_live_legacy_owner_is_retired_and_reclaimed() {
   write_arm_fixture "$dir" actionable
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_autoarm_owner "$dir" "$pid"
   record_autoarm_owner_identity "$dir" "$pid" || fail "could not record a claim pid-identity"
   record_autoarm_epoch "$dir" 464 "$pid" arming
@@ -1187,6 +1215,7 @@ test_stopped_legacy_owner_is_reclaimed_with_term_pending() {
   write_arm_fixture "$dir" actionable
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_autoarm_owner "$dir" "$pid"
   record_autoarm_owner_identity "$dir" "$pid" || fail "could not record a claim pid-identity"
   record_autoarm_epoch "$dir" 464 "$pid" arming
@@ -1242,6 +1271,7 @@ test_open_generation_claim_defers_without_any_lock() {
         printf "%s\n" "$$" > "$FM_HOME/state/.lock"
         sleep 60 &
         owner=$!
+        fm_test_track_pid "$owner" || exit 70
         identity=$(. "$FM_HOME/bin/fm-wake-lib.sh"; fm_pid_identity "$owner") || exit 97
         printf "epoch=464 owner_pid=%s outcome=arming updated_at=1\n%s\n" "$owner" "$identity" \
           > "$FM_HOME/state/.claude-autoarm-epoch"
@@ -1270,6 +1300,7 @@ test_stuck_generation_claim_is_superseded_and_rearms() {
   write_arm_fixture "$dir" actionable
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   record_autoarm_v2_claim "$dir" 464 "$pid" arming "$pid" || fail "could not record a v2 claim"
   touch -t 202001010000 "$dir/state/.claude-autoarm-epoch"
   touch -t 202001010000 "$dir/state/.last-watcher-beat"
@@ -1306,7 +1337,9 @@ test_orphaned_claim_from_dead_session_is_superseded_by_replacement() {
       printf "%s\n" "$$" > "$FM_HOME/state/.lock"
       printf "%s\n" "{\"session_id\":\"sess-dying\",\"stop_hook_active\":false}" \
         | "$FM_HOME/bin/fm-claude-stop-autoarm.sh" > "$FM_HOME/state/orphan-out" 2>&1 &
-      printf "%s\n" "$!" > "$FM_HOME/state/orphan-hook-pid"
+      orphan=$!
+      fm_test_track_pid "$orphan" || exit 70
+      printf "%s\n" "$orphan" > "$FM_HOME/state/orphan-hook-pid"
       for _ in $(seq 1 250); do [ -e "$FM_HOME/state/arm-ran" ] && break; sleep 0.02; done
     '
   orphan_pid=$(cat "$dir/state/orphan-hook-pid")
@@ -1326,6 +1359,7 @@ test_orphaned_claim_from_dead_session_is_superseded_by_replacement() {
         "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
       ' > "$dir/state/replacement-out" 2>&1 &
   RUN_AUTOARM_BG_PID=$!
+  fm_test_track_pid "$RUN_AUTOARM_BG_PID" || fail "could not register background hook cleanup"
   for i in $(seq 1 250); do
     kill -0 "$RUN_AUTOARM_BG_PID" 2>/dev/null || break
     [ "$(wc -l < "$dir/state/arm-ran")" -ge 2 ] && break
@@ -1376,7 +1410,9 @@ test_resumed_same_id_session_supersedes_the_orphan() {
       printf "%s\n" "$$" > "$FM_HOME/state/.lock"
       printf "%s\n" "{\"session_id\":\"sess-resumed\",\"stop_hook_active\":false}" \
         | "$FM_HOME/bin/fm-claude-stop-autoarm.sh" > "$FM_HOME/state/orphan-out" 2>&1 &
-      printf "%s\n" "$!" > "$FM_HOME/state/orphan-hook-pid"
+      orphan=$!
+      fm_test_track_pid "$orphan" || exit 70
+      printf "%s\n" "$orphan" > "$FM_HOME/state/orphan-hook-pid"
       for _ in $(seq 1 250); do [ -e "$FM_HOME/state/arm-ran" ] && break; sleep 0.02; done
     '
   orphan_pid=$(cat "$dir/state/orphan-hook-pid")
@@ -1397,6 +1433,7 @@ test_resumed_same_id_session_supersedes_the_orphan() {
         "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
       ' > "$dir/state/replacement-out" 2>&1 &
   RUN_AUTOARM_BG_PID=$!
+  fm_test_track_pid "$RUN_AUTOARM_BG_PID" || fail "could not register background hook cleanup"
   for i in $(seq 1 250); do
     kill -0 "$RUN_AUTOARM_BG_PID" 2>/dev/null || break
     [ "$(wc -l < "$dir/state/arm-ran")" -ge 2 ] && break
@@ -1449,10 +1486,13 @@ test_recycled_bridge_claim_stays_open_on_session_id_match() {
         . "$1/bin/fm-session-lock-lib.sh"
         sleep 60 &
         owner=$!
+        fm_test_track_pid "$owner" || exit 70
         sleep 60 &
         other=$!
+        fm_test_track_pid "$other" || exit 70
         sleep 61 &
         predecessor=$!
+        fm_test_track_pid "$predecessor" || exit 70
         identity=$(fm_pid_identity "$owner") || exit 97
         lock_identity=$(fm_pid_identity "$other") || exit 97
         if [ "$4" != current ]; then
@@ -1507,6 +1547,7 @@ test_claim_without_numeric_session_lock_is_not_open() {
         . "$1/bin/fm-wake-lib.sh"
         sleep 60 &
         owner=$!
+        fm_test_track_pid "$owner" || exit 70
         identity=$(fm_pid_identity "$owner") || exit 97
         printf "epoch=464 owner_pid=%s outcome=arming updated_at=1\n%s\n" "$owner" "$identity" \
           > "$1/state/.claude-autoarm-epoch"
@@ -1540,6 +1581,7 @@ test_identityless_ledger_never_defers() {
   write_arm_fixture "$dir" actionable
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   printf 'epoch=464 owner_pid=%s outcome=arming updated_at=1\n' "$pid" \
     > "$dir/state/.claude-autoarm-epoch"
   touch -t 202001010000 "$dir/state/.claude-autoarm-epoch"
@@ -1995,6 +2037,11 @@ test_fm_lock_status_still_works_with_shared_lib() {
   assert_contains "$out" "lock: free" "fm-lock.sh status must keep working after the session-lock lib extraction"
   pass "fm-lock: shared session-lock lib preserves the status path"
 }
+
+# Failure-unwind coverage sources the fixtures without running this suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
 
 test_inert_in_child_worktree
 test_inert_without_session_lock
