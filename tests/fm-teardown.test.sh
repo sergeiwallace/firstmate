@@ -4981,18 +4981,25 @@ test_process_spawned_during_grace_is_reaped_on_later_pass() {
   child_file="$case_dir/child.pid"
 
   ( cd "$case_dir/wt" && exec perl -e '
-      my ($file, $registry, $identity_lib) = @ARGV;
+      my ($file, $registry) = @ARGV;
       $SIG{TERM} = sub {
         my $child = fork();
         die "fork" unless defined $child;
         if (!$child) { exec "sleep", "300"; }
         # Register birth identity before publishing the child or exiting the
         # parent. The shell finalizer must also own this late-spawned sleeper.
-        open my $probe, "-|", "bash", "-c", q{. "$1"; fm_pid_start_time "$2"},
-          "_", $identity_lib, $child or die "identity probe";
-        my $identity = <$probe>;
-        close $probe;
-        chomp $identity;
+        # Same birth stamp as fm_test_pid_start_time: /proc field 22, else ps.
+        my $identity;
+        if (open my $probe, "<", "/proc/$child/stat") {
+          my $stat = <$probe>;
+          close $probe;
+          $stat =~ s/^.*\) //;
+          $identity = (split / /, $stat)[19];
+        } else {
+          $identity = `ps -o lstart= -p $child`;
+          chomp $identity;
+        }
+        die "identity probe" unless defined $identity && length $identity;
         open my $owned, ">>", $registry or die "registry";
         print {$owned} "$child\t$identity\n";
         close $owned;
@@ -5002,7 +5009,7 @@ test_process_spawned_during_grace_is_reaped_on_later_pass() {
         exit 0;
       };
       sleep 300;
-    ' "$child_file" "$FM_TEST_PID_REGISTRY" "$ROOT/bin/fm-wake-lib.sh" ) &
+    ' "$child_file" "$FM_TEST_PID_REGISTRY" ) &
   pid=$!
   fm_test_track_pid "$pid" || fail "could not register fixture process cleanup"
   disown

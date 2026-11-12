@@ -204,9 +204,21 @@ FM_TEST_OWNER_IDENTITY=$(fm_test_pid_identity "$$") || {
 # Birth identity survives exec, but refuses a reused PID.
 FM_TEST_PID_REGISTRY=$(mktemp "$FM_TEST_TMPDIR/.fm-test-pids.$$.XXXXXX") || return 1
 
-fm_test_pid_start_time() {
-  FM_STATE_OVERRIDE="$FM_TEST_TMPDIR" bash -c \
-    '. "$1"; fm_pid_start_time "$2"' _ "$ROOT/bin/fm-wake-lib.sh" "$1"
+fm_test_pid_start_time() {  # <pid>; prints the process birth stamp, fails when gone
+  local pid=$1 stat stamp
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  if [ -r "/proc/$pid/stat" ]; then
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    stat=${stat##*) }  # drop "pid (comm) ": comm may contain spaces
+    # shellcheck disable=SC2086
+    set -- $stat       # field 3 is $1, so field 22 (starttime) is $20
+    [ -n "${20:-}" ] || return 1
+    printf '%s\n' "${20}"
+  else
+    stamp=$(ps -o lstart= -p "$pid" 2>/dev/null) || return 1
+    [ -n "$stamp" ] || return 1
+    printf '%s\n' "$stamp"
+  fi
 }
 
 fm_test_track_pid() {  # <pid>, immediately after spawning a child
