@@ -253,7 +253,59 @@ test_pid_mismatch_survives_root_fallback() {
   pass 'root discovery cannot override a registered PID identity refusal'
 }
 
+test_failed_guard_recovery_reaps_sleeper() {
+  local lab pid identity rc=0
+  lab=$(mktemp -d "$TMP_ROOT/guard.XXXXXX")
+  bash -c '
+    FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY=1
+    . "$1/tests/fm-guard-stale-banner.test.sh"
+    # Keep the observer outside the sourced suite fixture, which EXIT removes.
+    observer=$2
+    record_live_watcher() {
+      kill -0 "$2" || exit 70
+      printf "%s\t%s\n" "$2" "$(fm_test_pid_start_time "$2")" > "$observer/owned.pid"
+      return 73
+    }
+    test_healthy_recovery_rearms_next_stale_episode
+  ' _ "$ROOT" "$lab" > "$lab/stdout" 2> "$lab/stderr" || rc=$?
+  IFS=$'\t' read -r pid identity < "$lab/owned.pid" || fail 'guard never reached the live watcher'
+  printf '%s\t%s\n' "$pid" "$identity" >> "$FM_TEST_PID_REGISTRY"
+  expect_code 1 "$rc" 'recording failure must reach the original guard assertion'
+  assert_grep 'could not record the live watcher for recovery' "$lab/stderr" 'guard failure was not injected'
+  assert_stopped "$pid" 'guard recovery leaked its sleeper after recording failed'
+  pass 'guard recovery reaps its sleeper when recording the live watcher fails'
+}
+
+test_failed_autoarm_assertion_reaps_sleeper() {
+  local lab pid identity rc=0
+  lab=$(mktemp -d "$TMP_ROOT/autoarm.XXXXXX")
+  bash -c '
+    FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY=1
+    . "$1/tests/fm-claude-stop-autoarm.test.sh"
+    observer=$2
+    make_primary_dir() {
+      mkdir -p "$1/state" "$1/bin"
+      printf "%s\n" "$1"
+    }
+    watcher_identity() { fm_test_pid_identity "$2"; }
+    run_autoarm() {
+      kill -0 "$pid" || exit 70
+      printf "%s\t%s\n" "$pid" "$(fm_test_pid_start_time "$pid")" > "$observer/owned.pid"
+      return 73
+    }
+    test_actionable_close_with_live_successor_rewakes_once
+  ' _ "$ROOT" "$lab" > "$lab/stdout" 2> "$lab/stderr" || rc=$?
+  IFS=$'\t' read -r pid identity < "$lab/owned.pid" || fail 'autoarm never reached the live successor'
+  printf '%s\t%s\n' "$pid" "$identity" >> "$FM_TEST_PID_REGISTRY"
+  expect_code 1 "$rc" 'unexpected autoarm status must fail the original assertion'
+  assert_grep 'got 73' "$lab/stderr" 'autoarm did not exercise the injected status'
+  assert_stopped "$pid" 'autoarm assertion leaked its live successor'
+  pass 'autoarm reaps its live successor when the later status assertion fails'
+}
+
 case ${1:-all} in
+  guard) test_failed_guard_recovery_reaps_sleeper ;;
+  autoarm) test_failed_autoarm_assertion_reaps_sleeper ;;
   cell) test_failed_grok_cell_is_cleaned ;;
   teardown) test_failed_teardown_case_reaps_sleeper ;;
   fake-cell) test_early_cell_failure_with_fake_server ;;
@@ -261,6 +313,6 @@ case ${1:-all} in
   child) test_live_child_deadline_and_parent_death ;;
   siblings) test_teardown_siblings_unwind_safely ;;
   mismatch-root) test_pid_mismatch_survives_root_fallback ;;
-  all) test_failed_grok_cell_is_cleaned; test_failed_teardown_case_reaps_sleeper; test_early_cell_failure_with_fake_server; test_pid_mismatch_is_never_signalled; test_live_child_deadline_and_parent_death; test_teardown_siblings_unwind_safely; test_pid_mismatch_survives_root_fallback ;;
+  all) test_failed_grok_cell_is_cleaned; test_failed_teardown_case_reaps_sleeper; test_early_cell_failure_with_fake_server; test_pid_mismatch_is_never_signalled; test_live_child_deadline_and_parent_death; test_teardown_siblings_unwind_safely; test_pid_mismatch_survives_root_fallback; test_failed_guard_recovery_reaps_sleeper; test_failed_autoarm_assertion_reaps_sleeper ;;
   *) fail 'unknown cleanup regression' ;;
 esac
