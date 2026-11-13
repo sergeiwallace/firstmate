@@ -7,6 +7,9 @@ set -u
 
 # shellcheck source=tests/wake-helpers.sh
 . "$(dirname "${BASH_SOURCE[0]}")/wake-helpers.sh"
+# Nested fixture shells share their owner's process cleanup registry.
+export FM_TEST_PID_REGISTRY
+export -f fm_test_track_pid fm_test_pid_start_time
 
 WATCH="$ROOT/bin/fm-watch.sh"
 WATCH_ARM="$ROOT/bin/fm-watch-arm.sh"
@@ -22,22 +25,24 @@ ARM_FAIL_EXIT_POLLS=400
 
 TMP_ROOT=$(fm_test_tmproot fm-watcher-lock-tests)
 
-# Execute the actual disposable-checkout guard before any watcher can start.
-lab="$TMP_ROOT/marked-lab"
-foreign_state="$TMP_ROOT/foreign-state"
-checkout="$TMP_ROOT/.no-mistakes/worktrees/guard/bin"
-mkdir -p "$lab" "$foreign_state" "$checkout"
-. "$ROOT/bin/fm-gate-refuse-lib.sh"
-fm_gate_lab_mark "$lab" || fail "could not mark the watcher lab"
-cp "$WATCH_ARM" "$ROOT/bin/fm-gate-refuse-lib.sh" "$checkout/"
-if env -u FM_GATE_REFUSE_BYPASS -u FM_STATE_OVERRIDE FM_HOME="$lab" STATE="$foreign_state" \
-  bash "$checkout/fm-watch-arm.sh" > "$TMP_ROOT/lab-guard.out" 2>&1; then
-  fail "disposable watcher accepted an inherited state outside its lab"
-fi
-grep -q 'refusing to arm from a disposable validation checkout' "$TMP_ROOT/lab-guard.out" \
-  || fail "disposable watcher did not reject the relocated state"
-[ ! -e "$foreign_state/.watch.lock" ] || fail "disposable watcher touched outside state"
-pass "disposable watcher refuses inherited state outside its marked lab"
+test_disposable_checkout_guard() {
+  # Execute the actual disposable-checkout guard before any watcher can start.
+  lab="$TMP_ROOT/marked-lab"
+  foreign_state="$TMP_ROOT/foreign-state"
+  checkout="$TMP_ROOT/.no-mistakes/worktrees/guard/bin"
+  mkdir -p "$lab" "$foreign_state" "$checkout"
+  . "$ROOT/bin/fm-gate-refuse-lib.sh"
+  fm_gate_lab_mark "$lab" || fail "could not mark the watcher lab"
+  cp "$WATCH_ARM" "$ROOT/bin/fm-gate-refuse-lib.sh" "$checkout/"
+  if env -u FM_GATE_REFUSE_BYPASS -u FM_STATE_OVERRIDE FM_HOME="$lab" STATE="$foreign_state" \
+    bash "$checkout/fm-watch-arm.sh" > "$TMP_ROOT/lab-guard.out" 2>&1; then
+    fail "disposable watcher accepted an inherited state outside its lab"
+  fi
+  grep -q 'refusing to arm from a disposable validation checkout' "$TMP_ROOT/lab-guard.out" \
+    || fail "disposable watcher did not reject the relocated state"
+  [ ! -e "$foreign_state/.watch.lock" ] || fail "disposable watcher touched outside state"
+  pass "disposable watcher refuses inherited state outside its marked lab"
+}
 
 drain_and_ack() {  # <state>
   local state=$1 err sequence generation
@@ -106,6 +111,7 @@ rearm_after_retained_cleanup() {
     "${pid:--}" "$alive" "$age" "${cmd:--}" >&2
   env PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$@" "$WATCH_ARM" > "$armout" &
   arm=$!
+  fm_test_track_pid "$arm" || ! kill -0 "$arm" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 80 ] && is_live_non_zombie "$arm"; do
     sleep 0.1
@@ -131,6 +137,7 @@ script = r'''
 . "$1"
 bash -c 'trap "" TERM; kill -STOP "$$"; exec sleep 300' &
 pid=$!
+fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
 for i in $(seq 1 100); do
   state=$(ps -p "$pid" -o stat=)
   case "$state" in *T*) break ;; esac
@@ -182,8 +189,10 @@ test_singleton_start() {
   out2="$dir/watch-two.out"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out1" &
   pid1=$!
+  fm_test_track_pid "$pid1" || ! kill -0 "$pid1" 2>/dev/null || fail "could not register fixture process cleanup"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out2" &
   pid2=$!
+  fm_test_track_pid "$pid2" || ! kill -0 "$pid2" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 50 ]; do
     live=0
@@ -220,6 +229,7 @@ test_stale_watch_lock_reclaimed() {
   printf '%s\n' "$dead_pid" > "$state/.watch.lock/pid"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   live=0
   lock_pid=
@@ -268,6 +278,7 @@ test_live_stalled_watch_lock_is_replaced_past_hard_bound() {
   err="$dir/watch.err"
   sleep 300 &
   holder=$!
+  fm_test_track_pid "$holder" || ! kill -0 "$holder" 2>/dev/null || fail "could not register fixture process cleanup"
   identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$holder") || fail "could not identify the fake holder"
   mkdir -p "$state/.watch.lock"
   printf '%s\n' "$holder" > "$state/.watch.lock/pid"
@@ -284,6 +295,7 @@ test_live_stalled_watch_lock_is_replaced_past_hard_bound() {
   # Same holder and beacon, a bound it is past -> evicted and replaced.
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=1 FM_WATCHER_STALL_BOUND=3 FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" 2> "$err" &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   lock_pid=
   while [ "$i" -lt 100 ]; do
@@ -374,6 +386,7 @@ test_guard_warnings() {
   printf 'project=x\n' > "$state/task.meta"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$pid") || fail "could not identify fresh guard watcher"
   mkdir -p "$state/.watch.lock"
   printf '%s\n' "$pid" > "$state/.watch.lock/pid"
@@ -409,6 +422,7 @@ test_lock_single_winner_under_concurrency() {
         sleep 1
       fi
     ' _ "$LIB" "$lockdir" "$marker" &
+    fm_test_track_pid "$!" || ! kill -0 "$!" 2>/dev/null || fail "could not register lock contender cleanup"
     pids="$pids $!"
     i=$((i + 1))
   done
@@ -461,6 +475,7 @@ leave_dead_link_locks() {  # <state> <lock>...
     exec sleep 30
   ' _ "$LIB" "$ready" "$@" >/dev/null 2>&1 &
   holder=$!
+  fm_test_track_pid "$holder" || ! kill -0 "$holder" 2>/dev/null || fail "could not register fixture process cleanup"
   # A loaded serial shard can stall the holder's startup past a second; allow
   # the same ~5s as this file's other child-startup waits.
   i=0
@@ -609,6 +624,7 @@ if [ "$last" = "$FM_TEST_RACE_PATH" ] && mkdir "$FM_TEST_RACE_ONCE" 2>/dev/null;
     fi
     printf "lost\n" > "$3"
   ' _ "$FM_TEST_LIB" "$last" "$FM_TEST_RACE_OUT" >/dev/null 2>&1 &
+  fm_test_track_pid "$!" || exit 70
   i=0
   while [ "$i" -lt 100 ] && [ ! -s "$FM_TEST_RACE_OUT" ]; do
     sleep 0.05
@@ -665,6 +681,7 @@ test_lock_stale_steal_single_winner_under_concurrency() {
     IFS= read -r _ < "$5"
   ' _ "$LIB" "$lockdir" "$marker" "$gate" "$hold" &
   waiter=$!
+  fm_test_track_pid "$waiter" || ! kill -0 "$waiter" 2>/dev/null || fail "could not register fixture process cleanup"
   pids=
   i=1
   while [ "$i" -le 39 ]; do
@@ -676,6 +693,7 @@ test_lock_stale_steal_single_winner_under_concurrency() {
         IFS= read -r _ < "$5"
       fi
     ' _ "$LIB" "$lockdir" "$marker" "$gate" "$hold" &
+    fm_test_track_pid "$!" || ! kill -0 "$!" 2>/dev/null || fail "could not register lock contender cleanup"
     pids="$pids $!"
     i=$((i + 1))
   done
@@ -708,6 +726,7 @@ test_lock_live_steal_mutex_is_not_reclaimed() {
     fm_lock_release "$2.steal"
   ' _ "$LIB" "$lockdir" "$holder_file" &
   holder=$!
+  fm_test_track_pid "$holder" || ! kill -0 "$holder" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 50 ] && [ ! -s "$holder_file" ]; do
     sleep 0.1
@@ -738,6 +757,7 @@ test_lock_does_not_steal_live_lock() {
   lockdir="$state/.contend.lock"
   sleep 300 &
   live=$!
+  fm_test_track_pid "$live" || ! kill -0 "$live" 2>/dev/null || fail "could not register fixture process cleanup"
   mkdir "$lockdir"
   printf '%s\n' "$live" > "$lockdir/pid"
   out=$(FM_STATE_OVERRIDE="$state" bash -c '
@@ -849,6 +869,7 @@ test_watch_restart_rejects_reused_pid() {
   out="$dir/restart.out"
   sleep 300 &
   live=$!
+  fm_test_track_pid "$live" || ! kill -0 "$live" 2>/dev/null || fail "could not register fixture process cleanup"
   mkdir "$state/.watch.lock"
   printf '%s\n' "$live" > "$state/.watch.lock/pid"
   printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
@@ -856,6 +877,7 @@ test_watch_restart_rejects_reused_pid() {
   printf '%s\n' "stale watcher identity" > "$state/.watch.lock/pid-identity"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$out" &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 80 ] && is_live_non_zombie "$pid"; do
     sleep 0.1
@@ -881,6 +903,7 @@ test_watch_restart_attaches_to_healthy_peer() {
   peer_ready="$dir/peer.ready"
   node -e 'const fs = require("node:fs"); process.on("SIGTERM", () => {}); fs.writeFileSync(process.argv[1], "ready\n"); setTimeout(() => {}, 300000)' "$peer_ready" &
   peer=$!
+  fm_test_track_pid "$peer" || ! kill -0 "$peer" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 50 ] && [ ! -s "$peer_ready" ]; do
     sleep 0.1
@@ -900,6 +923,7 @@ test_watch_restart_attaches_to_healthy_peer() {
   touch "$state/.last-watcher-beat"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_ATTACH_POLL=0.1 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" --restart > "$out" &
   armpid=$!
+  fm_test_track_pid "$armpid" || ! kill -0 "$armpid" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 80 ]; do
     grep -qF "watcher: attached pid=$peer" "$out" 2>/dev/null && break
@@ -926,6 +950,7 @@ test_watcher_self_evicts_on_lock_takeover() {
   out="$dir/watch.out"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=0.2 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 80 ]; do
     [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$pid" ] \
@@ -963,6 +988,7 @@ test_arm_self_eviction_is_loud_without_successor() {
   # same budget bounds the successor wait this case deliberately spends below.
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=0.2 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
   armpid=$!
+  fm_test_track_pid "$armpid" || ! kill -0 "$armpid" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 80 ]; do
     grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
@@ -994,6 +1020,7 @@ test_arm_attaches_and_waits_for_live_fresh_watcher() {
   # A genuinely live watcher with a fresh beacon already holds the singleton.
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" 2>&1 &
   wpid=$!
+  fm_test_track_pid "$wpid" || ! kill -0 "$wpid" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 60 ]; do
     [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] && [ -e "$state/.last-watcher-beat" ] && break
@@ -1005,6 +1032,7 @@ test_arm_attaches_and_waits_for_live_fresh_watcher() {
   # exit while the seed still holds the healthy lock.
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_ARM_ATTACH_POLL=0.1 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" > "$armout" &
   armpid=$!
+  fm_test_track_pid "$armpid" || ! kill -0 "$armpid" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 80 ]; do
     grep -qF "watcher: attached pid=$wpid" "$armout" 2>/dev/null && break
@@ -1034,6 +1062,7 @@ test_attached_arm_signal_is_recorded_in_cycle_ledger() {
   armout="$dir/arm.out"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" 2>&1 &
   wpid=$!
+  fm_test_track_pid "$wpid" || ! kill -0 "$wpid" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 60 ]; do
     [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] && [ -e "$state/.last-watcher-beat" ] && break
@@ -1043,6 +1072,7 @@ test_attached_arm_signal_is_recorded_in_cycle_ledger() {
   [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] || fail "seed watcher did not take the lock"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_ARM_ATTACH_POLL=0.1 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" > "$armout" &
   armpid=$!
+  fm_test_track_pid "$armpid" || ! kill -0 "$armpid" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 80 ]; do
     grep -qF "watcher: attached pid=$wpid" "$armout" 2>/dev/null && break
@@ -1090,6 +1120,7 @@ SH
     FM_TEST_ARM_PID_FILE="$pidfile" FM_POLL=5 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" 2>&1 &
   armpid=$!
+  fm_test_track_pid "$armpid" || ! kill -0 "$armpid" 2>/dev/null || fail "could not register fixture process cleanup"
   printf '%s\n' "$armpid" > "$pidfile"
   i=0
   while [ "$i" -lt 100 ] && is_live_non_zombie "$armpid"; do
@@ -1136,6 +1167,7 @@ SH
     FM_ARM_CONFIRM_TIMEOUT=2 FM_POLL=5 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" 2>&1 &
   armpid=$!
+  fm_test_track_pid "$armpid" || ! kill -0 "$armpid" 2>/dev/null || fail "could not register fixture process cleanup"
   printf '%s\n' "$armpid" > "$pidfile"
   i=0
   while [ "$i" -lt 100 ] && is_live_non_zombie "$armpid"; do
@@ -1178,6 +1210,7 @@ test_arm_starts_and_self_heals() {
     fi
     PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
     armpid=$!
+    fm_test_track_pid "$armpid" || ! kill -0 "$armpid" 2>/dev/null || fail "could not register fixture process cleanup"
     i=0
     while [ "$i" -lt 80 ]; do
       if [ "$row" = dead-pid ]; then
@@ -1217,6 +1250,7 @@ test_arm_hup_cleans_child_and_temp_output() {
   armout="$dir/arm.out"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
   armpid=$!
+  fm_test_track_pid "$armpid" || ! kill -0 "$armpid" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 80 ]; do
     grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
@@ -1278,6 +1312,7 @@ test_arm_waits_for_peer_beacon_after_child_stands_down() {
   armout="$dir/arm.out"
   sleep 300 &
   peer=$!
+  fm_test_track_pid "$peer" || ! kill -0 "$peer" 2>/dev/null || fail "could not register fixture process cleanup"
   identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") || fail "could not identify peer pid"
   mkdir "$state/.watch.lock"
   printf '%s\n' "$peer" > "$state/.watch.lock/pid"
@@ -1289,6 +1324,7 @@ test_arm_waits_for_peer_beacon_after_child_stands_down() {
   # window stays production-sized (issue #2844).
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_ATTACH_POLL=0.1 "$WATCH_ARM" > "$armout" &
   armpid=$!
+  fm_test_track_pid "$armpid" || ! kill -0 "$armpid" 2>/dev/null || fail "could not register fixture process cleanup"
   # Synchronize on the owned child declining the live peer lock before making
   # the peer healthy. Sleeping for the same budget the arm spends made this
   # regression fixture race the confirmation deadline under full-suite load,
@@ -1329,6 +1365,7 @@ test_arm_fails_loud_when_no_fresh_watcher_confirmable() {
   armout="$dir/arm.out"
   sleep 300 &
   live=$!
+  fm_test_track_pid "$live" || ! kill -0 "$live" 2>/dev/null || fail "could not register fixture process cleanup"
   # A live process holds the lock but is NOT a confirmable watcher (no identity),
   # and the beacon is stale. The fresh child cannot steal a LIVE lock, so no
   # watcher can ever be confirmed - the honest answer is FAILED, not healthy.
@@ -1337,6 +1374,7 @@ test_arm_fails_loud_when_no_fresh_watcher_confirmable() {
   touch -t 200001010000 "$state/.last-watcher-beat"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=3 "$WATCH_ARM" > "$armout" &
   armpid=$!
+  fm_test_track_pid "$armpid" || ! kill -0 "$armpid" 2>/dev/null || fail "could not register fixture process cleanup"
   wait_for_exit "$armpid" 120
   status=$?
   [ "$status" -ne 124 ] || fail "arm never returned for an unconfirmable watcher"
@@ -1367,6 +1405,7 @@ SH
 
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=0 FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
   first_arm=$!
+  fm_test_track_pid "$first_arm" || ! kill -0 "$first_arm" 2>/dev/null || fail "could not register fixture process cleanup"
   wait "$first_arm" || fail "first ledger cycle did not surface its actionable wake"
   grep -q "arm_pid=$first_arm.*reason=actionable-check.*successor=none" "$state/.watch-cycle-exits.log" \
     || fail "first ledger record omitted its actionable classification"
@@ -1376,6 +1415,7 @@ SH
   armout="$dir/successor-arm.out"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WATCH_PREDECESSOR_ARM_PID="$first_arm" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" 2> "$dir/successor-arm.err" &
   successor_arm=$!
+  fm_test_track_pid "$successor_arm" || ! kill -0 "$successor_arm" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 80 ]; do
     grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
@@ -1404,6 +1444,7 @@ SH
     armout="$dir/bounded-$iteration.out"
     PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WATCH_CYCLE_LOG_MAX_BYTES=1400 FM_WATCH_CYCLE_LOG_KEEP_LINES=2 FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" 2> "$dir/bounded-$iteration.err" &
     successor_arm=$!
+    fm_test_track_pid "$successor_arm" || ! kill -0 "$successor_arm" 2>/dev/null || fail "could not register fixture process cleanup"
     i=0
     while [ "$i" -lt 80 ]; do
       grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
@@ -1444,6 +1485,7 @@ test_retained_cleanup_recovers_through_the_next_arm() {
   held="$dir/holder.held"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WATCHER_CLEANUP_LOCK_BOUND=1 FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" 2> "$armerr" &
   arm=$!
+  fm_test_track_pid "$arm" || ! kill -0 "$arm" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 80 ]; do
     grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
@@ -1459,6 +1501,7 @@ test_retained_cleanup_recovers_through_the_next_arm() {
     fm_lock_release "$2"
   ' _ "$LIB" "$state/.watcher-down.lock" "$held" &
   holder=$!
+  fm_test_track_pid "$holder" || ! kill -0 "$holder" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 80 ] && [ ! -e "$held" ]; do
     sleep 0.1
@@ -1491,6 +1534,7 @@ test_stopped_watcher_is_live_but_stale_then_exit_is_classified() {
   armout="$dir/arm.out"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
   armpid=$!
+  fm_test_track_pid "$armpid" || ! kill -0 "$armpid" 2>/dev/null || fail "could not register fixture process cleanup"
   i=0
   while [ "$i" -lt 80 ]; do
     grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
@@ -1530,6 +1574,7 @@ test_pid_identity_is_locale_invariant() {
   local real_first real_second observed
   sleep 300 &
   live=$!
+  fm_test_track_pid "$live" || ! kill -0 "$live" 2>/dev/null || fail "could not register fixture process cleanup"
   no_proc="$TMP_ROOT/no-proc"
   fakebin="$TMP_ROOT/locale-ps"
   locale_log="$TMP_ROOT/locale-ps.observed"
@@ -1593,6 +1638,7 @@ test_pid_identity_is_terminal_width_invariant() {
   fi
   sleep "$long_arg" &
   live=$!
+  fm_test_track_pid "$live" || ! kill -0 "$live" 2>/dev/null || fail "could not register fixture process cleanup"
   narrow=$(COLUMNS=20 FM_PROC_ROOT_OVERRIDE="$no_proc" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live" 2>/dev/null)
   wide=$(COLUMNS=1000 FM_PROC_ROOT_OVERRIDE="$no_proc" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live" 2>/dev/null)
   kill "$live" 2>/dev/null || true
@@ -1697,6 +1743,7 @@ test_msys_pid_identity_uses_proc() {
   esac
   sleep 300 &
   live=$!
+  fm_test_track_pid "$live" || ! kill -0 "$live" 2>/dev/null || fail "could not register fixture process cleanup"
   identity=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live" 2>/dev/null)
   kill "$live" 2>/dev/null || true
   wait "$live" 2>/dev/null || true
@@ -1707,6 +1754,12 @@ test_msys_pid_identity_uses_proc() {
   pass "MSYS process identity uses compatible /proc fields"
 }
 
+# Failure-unwind regressions load fixtures without running the suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
+
+test_disposable_checkout_guard
 test_wait_deadline_reaps_a_stopped_child
 test_singleton_start
 test_pid_identity_is_locale_invariant

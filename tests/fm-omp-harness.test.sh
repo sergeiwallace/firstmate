@@ -506,6 +506,7 @@ test_ownership_proof_is_omp_keyed() {
   local root home pid
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   root="$TMP_ROOT/own/root"; home="$TMP_ROOT/own/home"
   record_omp_session "$root" "$home" "$pid" || fail "could not record the omp session"
   owns "$root" "$home" || fail "a live session that loaded both omp extensions must own supervision"
@@ -529,6 +530,7 @@ test_ownership_proof_is_omp_keyed() {
   # The pull-guard verdict tolerates the extension's own hand-off only with the proof.
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   root="$TMP_ROOT/own-verdict/root"; home="$TMP_ROOT/own-verdict/home"
   record_omp_session "$root" "$home" "$pid" || fail "could not record the verdict session"
   touch "$home/state/.last-watcher-beat"
@@ -962,6 +964,11 @@ EOF
   [ -z "$out" ] || fail "omp watch extension split host close test printed output: $out"
   pass ".omp watch extension: a host close split across stream chunks reaches main as one whole follow-up"
 }
+
+# Failure-unwind regressions load fixtures without running the suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
 
 test_detection_anchored_name_and_marker_precedence
 test_lock_identity_and_liveness_classification

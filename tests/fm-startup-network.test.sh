@@ -27,6 +27,9 @@ set -u
 . "$ROOT/bin/fm-timeout-lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-startup-network-tests)
+# Interrupted and superseded workers must leave their scratch inside the
+# registered fixture tree, even when they cannot reach their normal cleanup.
+export TMPDIR="$TMP_ROOT"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
 FM_TEST_CLEANUP_DIRS+=("$TMP_ROOT")
 trap fm_test_cleanup EXIT
@@ -145,6 +148,7 @@ hold_publish_lock() {  # <home>
     fm_lock_try_acquire "$2" || exit 1
     exec sleep 120' _ "$ROOT/bin" "$lock" >/dev/null 2>&1 </dev/null &
   holder=$!
+  fm_test_track_pid "$holder" || ! kill -0 "$holder" 2>/dev/null || fail "could not register fixture process cleanup"
   while [ "$(cat "$lock/pid" 2>/dev/null || true)" != "$holder" ] && [ "$waited" -lt 50 ]; do
     sleep 0.1
     waited=$((waited + 1))
@@ -209,6 +213,7 @@ EOF
 
   sleep 30 &
   claimant=$!
+  fm_test_track_pid "$claimant" || ! kill -0 "$claimant" 2>/dev/null || fail "could not register fixture process cleanup"
   FM_SESSION_START_TIMEOUT=15 FM_FAKE_BOOTSTRAP_LOG="$log" FM_FAKE_BOOTSTRAP_OUT='acknowledged result' \
     run_stage "$home" "$root" start --locked 0 --harvest-pid "$claimant"
   run_stage "$home" "$root" wait 30 >/dev/null || fail "the claimed worker never published"
@@ -258,6 +263,7 @@ $rec
 EOF
   sleep 10 &
   claimant=$!
+  fm_test_track_pid "$claimant" || ! kill -0 "$claimant" 2>/dev/null || fail "could not register fixture process cleanup"
   # Actionable output: a clean success in this same crash window must stay
   # silent (test_a_successful_result_never_queues_a_wake owns that case).
   FM_SESSION_START_TIMEOUT=4 FM_FAKE_BOOTSTRAP_LOG="$log" \
@@ -286,7 +292,7 @@ EOF
   chmod 500 "$home/state/.startup-network.report"
   sleep 10 &
   claimant=$!
-
+  fm_test_track_pid "$claimant" || ! kill -0 "$claimant" 2>/dev/null || fail "could not register fixture process cleanup"
   FM_SESSION_START_TIMEOUT=4 FM_FAKE_BOOTSTRAP_LOG="$log" FM_FAKE_BOOTSTRAP_OUT='unpublishable result' \
     run_stage "$home" "$root" start --locked 0 --harvest-pid "$claimant"
   run_stage "$home" "$root" wait 30 >/dev/null || fail "the report-publication failure never settled"
@@ -323,6 +329,7 @@ $rec
 EOF
   sleep 10 &
   claimant=$!
+  fm_test_track_pid "$claimant" || ! kill -0 "$claimant" 2>/dev/null || fail "could not register fixture process cleanup"
   FM_SESSION_START_TIMEOUT=4 FM_FAKE_BOOTSTRAP_LOG="$log" \
     run_stage "$home" "$root" start --locked 0 --harvest-pid "$claimant"
   run_stage "$home" "$root" wait 30 >/dev/null || fail "the unclaimed successful worker never published"
@@ -364,6 +371,7 @@ $rec
 EOF
   sleep 10 &
   claimant=$!
+  fm_test_track_pid "$claimant" || ! kill -0 "$claimant" 2>/dev/null || fail "could not register fixture process cleanup"
   FM_SESSION_START_TIMEOUT=4 FM_FAKE_BOOTSTRAP_LOG="$log" \
     FM_FAKE_BOOTSTRAP_OUT='MISSING: some-tool (install: brew install some-tool)' \
     run_stage "$home" "$root" start --locked 0 --harvest-pid "$claimant"
@@ -858,6 +866,11 @@ EOF
   kill "$holder" 2>/dev/null || true
   pass "fm-startup-network: a held publish lock ends the worker inside its budget with a failed-rerun record"
 }
+
+# Failure-unwind regressions load fixtures without running the suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
 
 test_wait_fails_without_a_published_stage
 test_start_returns_without_holding_the_callers_stdout

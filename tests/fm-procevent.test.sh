@@ -15,6 +15,9 @@ set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# Nested fixture shells share their owner's process cleanup registry.
+export FM_TEST_PID_REGISTRY
+export -f fm_test_track_pid fm_test_pid_start_time
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TMP_ROOT=$(fm_test_tmproot fm-procevent-tests)
@@ -206,6 +209,7 @@ hold_source_lock() {  # <source-id> <ready-file> <release-file>
     done
   ' _ "$ROOT" "$id" "$ready" "$release" "$parent" &
   HOLDER_PID=$!
+  fm_test_track_pid "$HOLDER_PID" || ! kill -0 "$HOLDER_PID" 2>/dev/null || fail "could not register fixture process cleanup"
 }
 
 hold_source_lock_then_handle() {  # <home> <source-id> <sequence> <ready-file> <release-file>
@@ -224,7 +228,31 @@ hold_source_lock_then_handle() {  # <home> <source-id> <sequence> <ready-file> <
     fm_procevent_mark_handled "$3/state" "$2" "$7"
   ' _ "$ROOT" "$id" "$home" "$ready" "$release" "$parent" "$seq" &
   HOLDER_PID=$!
+  fm_test_track_pid "$HOLDER_PID" || ! kill -0 "$HOLDER_PID" 2>/dev/null || fail "could not register fixture process cleanup"
 }
+
+test_reused_claim_preserves_innocent_process() {
+  local HI innocent_pid
+  HI="$TMP_ROOT/hi"; new_home "$HI"
+  pe_register "$HI" lavish reused-src -- /bin/true >/dev/null
+  sleep 60 &
+  innocent_pid=$!
+  fm_test_track_pid "$innocent_pid" || ! kill -0 "$innocent_pid" 2>/dev/null || fail "could not register fixture process cleanup"
+  printf '%s\n%s\nreused-token\nnot-the-live-process-identity\n' \
+    "$HI" "$innocent_pid" > "$FM_PROCEVENT_CLAIM_ROOT/reused-src.claim"
+  chmod 0600 "$FM_PROCEVENT_CLAIM_ROOT/reused-src.claim"
+  pe "$HI" retire reused-src >/dev/null
+  kill -0 "$innocent_pid" 2>/dev/null || fail "retirement signaled a PID whose identity did not match the claim"
+  kill "$innocent_pid" 2>/dev/null || true
+  wait "$innocent_pid" 2>/dev/null || true
+  assert_absent "$FM_PROCEVENT_CLAIM_ROOT/reused-src.claim" "retirement releases the exact reused-pid claim"
+  pass "detected PID reuse is refused before signalling"
+}
+
+# Failure-unwind regressions load fixtures without running the suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
 
 # --- inert with nothing configured ------------------------------------------
 IDLE="$TMP_ROOT/idle"; mkdir -p "$IDLE"
@@ -304,6 +332,7 @@ DIRECT_TRIGGER="$TMP_ROOT/direct-trigger"
 pe_register "$HPG" lavish direct-src -- "$BLOCKER" "$DIRECT_TRIGGER" "direct result" >/dev/null
 pe "$HPG" start direct-src > "$TMP_ROOT/direct-start.out" &
 direct_runner=$!
+fm_test_track_pid "$direct_runner" || ! kill -0 "$direct_runner" 2>/dev/null || fail "could not register fixture process cleanup"
 wait_for "$FM_PROCEVENT_CLAIM_ROOT/direct-src.claim" || fail "direct start never claimed its source"
 direct_leader=$(sed -n '2p' "$FM_PROCEVENT_CLAIM_ROOT/direct-src.claim")
 direct_group=$(ps -o pgid= -p "$direct_leader" 2>/dev/null | tr -d '[:space:]')
@@ -351,6 +380,7 @@ pe_register "$HPG" lavish shared-src -- "$BLOCKER" "$SHARED_TRIGGER" "shared res
 FM_HOME="$HPG" perl "$SHARED_LAUNCHER" "$SHARED_SIBLING" \
   "$ROOT/bin/fm-procevent.sh" start shared-src > "$TMP_ROOT/shared-start.out" &
 shared_launcher=$!
+fm_test_track_pid "$shared_launcher" || ! kill -0 "$shared_launcher" 2>/dev/null || fail "could not register fixture process cleanup"
 wait_for "$SHARED_SIBLING" || fail "shared caller group never started its unrelated sibling"
 wait_for "$FM_PROCEVENT_CLAIM_ROOT/shared-src.claim" || fail "shared-group start never claimed its source"
 shared_sibling=$(cat "$SHARED_SIBLING")
@@ -414,6 +444,7 @@ RACE_HANDLE_PID=$HOLDER_PID
 wait_for "$RACE_PUBLISH_READY" || fail "publication race barrier did not acquire the source lock"
 pe "$HRACE" reconcile > "$RACE_RECONCILE_OUT" &
 RACE_RECONCILE_PID=$!
+fm_test_track_pid "$RACE_RECONCILE_PID" || ! kill -0 "$RACE_RECONCILE_PID" 2>/dev/null || fail "could not register fixture process cleanup"
 sleep 0.3
 assert_absent "$HRACE/state/.wake-queue" "publication bypassed the source serialization boundary"
 : > "$RACE_PUBLISH_RELEASE"
@@ -610,6 +641,7 @@ pe_adapter "$HREPLACE" register endnow replace-src -- \
   "$STARTED_BLOCKER" "$OLD_STARTED" "$BLOCKER" "$OLD_TRIGGER" "old terminal payload" >/dev/null
 pe_adapter "$HREPLACE" start replace-src > "$TMP_ROOT/replace-old.out" 2>&1 &
 replace_old_pid=$!
+fm_test_track_pid "$replace_old_pid" || ! kill -0 "$replace_old_pid" 2>/dev/null || fail "could not register fixture process cleanup"
 wait_for "$OLD_STARTED" || fail "the old registration never started"
 pe_adapter "$HREPLACE" register openended replace-src -- /bin/echo "replacement payload" >/dev/null
 touch "$OLD_TRIGGER"
@@ -829,6 +861,7 @@ assert_contains "$list_out" "task:worker-1/listening" \
 PATH="$MULTI_BIN:$PATH" LAVISH_AXI_HOST=recovery.example LAVISH_AXI_PORT=34387 FM_HOME="$HMULTI" \
   pe "$HMULTI" start "$multi_id" > "$MULTI_ROOT/run1" 2>&1 &
 MULTI_RUN=$!
+fm_test_track_pid "$MULTI_RUN" || ! kill -0 "$MULTI_RUN" 2>/dev/null || fail "could not register fixture process cleanup"
 for _ in $(seq 1 100); do [ "$(cat "$MULTI_ROOT/count" 2>/dev/null || true)" = 1 ] && break; sleep 0.02; done
 touch "$MULTI_ROOT/trigger1"
 for _ in $(seq 1 100); do [ -f "$HMULTI/state/worker-1.inbox/001.msg" ] && break; sleep 0.02; done
@@ -1457,6 +1490,7 @@ PATH="$LAVISH_SCRIPTED_BIN:$PATH" LAVISH_COUNT="$DEFAULT_RATE_COUNT" LAVISH_SCRI
   FM_LAVISH_POLL_RETRY_DELAY='' \
   "$ROOT/bin/fm-procevent-lavish.sh" poll "$DEFAULT_RATE_ART" >/dev/null 2>&1 &
 DEFAULT_RATE_PID=$!
+fm_test_track_pid "$DEFAULT_RATE_PID" || ! kill -0 "$DEFAULT_RATE_PID" 2>/dev/null || fail "could not register fixture process cleanup"
 perl -MTime::HiRes=sleep -e 'sleep 6.2'
 kill -TERM "$DEFAULT_RATE_PID" 2>/dev/null || true
 wait "$DEFAULT_RATE_PID" 2>/dev/null || true
@@ -1728,6 +1762,7 @@ TRIGW="$TMP_ROOT/trigger-restart-cut"
 pe_register "$HW" lavish restart-cut-src -- "$BLOCKER" "$TRIGW" "restart cut payload" >/dev/null
 pe "$HW" start restart-cut-src > "$TMP_ROOT/restart-cut-start.log" 2>&1 &
 restart_cut_start_pid=$!
+fm_test_track_pid "$restart_cut_start_pid" || ! kill -0 "$restart_cut_start_pid" 2>/dev/null || fail "could not register fixture process cleanup"
 sleep 0.5
 : > "$TRIGW"
 wait_for "$HW/state/.wake-queue" || fail "the restart-cut source published no event"
@@ -1897,6 +1932,7 @@ chmod 0600 "$FM_PROCEVENT_CLAIM_ROOT/race-src.claim"
 race_pids=()
 for _ in $(seq 1 24); do
   pe "$HR" start race-src >/dev/null &
+  fm_test_track_pid "$!" || ! kill -0 "$!" 2>/dev/null || fail "could not register claim contender cleanup"
   race_pids+=("$!")
 done
 wait_for "$RACE_LOG" 300 || fail "no contender acquired the stale claim"
@@ -2236,6 +2272,7 @@ assert_contains "$sr5_out" "uncertain=1" \
   || fail "the undrifted strand was not announced: $sr5_out"
 pe "$HSR5" start reused-plain-src > "$TMP_ROOT/reused-plain-start.out" 2>&1 &
 sr5_start_pid=$!
+fm_test_track_pid "$sr5_start_pid" || ! kill -0 "$sr5_start_pid" 2>/dev/null || fail "could not register fixture process cleanup"
 wait_for_lines "$SR5_LOG" 2 \
   || fail "start did not reclaim the undrifted reused-pid claim: $(cat "$TMP_ROOT/reused-plain-start.out")"
 [ "$(sed -n '2p' "$sr5_claim")" != "$sr5_leader" ] \
@@ -2438,6 +2475,7 @@ wait_for "$FC_READY" || fail "the fast-source fixture could not hold a source lo
   : > "$FC_RELEASE"
 ) &
 FC_RELEASER=$!
+fm_test_track_pid "$FC_RELEASER" || ! kill -0 "$FC_RELEASER" 2>/dev/null || fail "could not register fixture process cleanup"
 fc_rc=0
 fc_out=$(FM_PROCEVENT_LAUNCH_CONFIRM_SECONDS=2 pe "$HFC" reconcile) || fc_rc=$?
 wait "$FC_RELEASER" 2>/dev/null || true
@@ -2567,6 +2605,7 @@ torn_holder_pid=$HOLDER_PID
 wait_for "$TORN_READY" || fail "could not hold the torn-read source boundary"
 pe "$HJ" list > "$TMP_ROOT/torn-list.out" &
 torn_list_pid=$!
+fm_test_track_pid "$torn_list_pid" || ! kill -0 "$torn_list_pid" 2>/dev/null || fail "could not register fixture process cleanup"
 sleep 0.2
 kill -0 "$torn_list_pid" 2>/dev/null || fail "claim reader escaped the source boundary during replacement"
 mv "$TMP_ROOT/torn-next.claim" "$FM_PROCEVENT_CLAIM_ROOT/torn-src.claim"
@@ -2594,6 +2633,7 @@ retire_start_holder_pid=$HOLDER_PID
 wait_for "$START_READY" || fail "could not hold the retire-start source boundary"
 pe "$HK" start retire-start-src > "$TMP_ROOT/retire-start.out" 2>&1 &
 retire_start_pid=$!
+fm_test_track_pid "$retire_start_pid" || ! kill -0 "$retire_start_pid" 2>/dev/null || fail "could not register fixture process cleanup"
 sleep 0.2
 kill -0 "$retire_start_pid" 2>/dev/null || fail "start did not wait for the source lifecycle boundary"
 rm -f "$HK/state/procevent/retire-start-src.source"
@@ -2604,19 +2644,7 @@ assert_absent "$START_LOG" "a start queued before retirement must revalidate the
 assert_absent "$FM_PROCEVENT_CLAIM_ROOT/retire-start-src.claim" "retirement cannot leave a late claim"
 pass "retirement and start share one serialized lifecycle boundary"
 
-HI="$TMP_ROOT/hi"; new_home "$HI"
-pe_register "$HI" lavish reused-src -- /bin/true >/dev/null
-sleep 60 &
-innocent_pid=$!
-printf '%s\n%s\nreused-token\nnot-the-live-process-identity\n' \
-  "$HI" "$innocent_pid" > "$FM_PROCEVENT_CLAIM_ROOT/reused-src.claim"
-chmod 0600 "$FM_PROCEVENT_CLAIM_ROOT/reused-src.claim"
-pe "$HI" retire reused-src >/dev/null
-kill -0 "$innocent_pid" 2>/dev/null || fail "retirement signaled a PID whose identity did not match the claim"
-kill "$innocent_pid" 2>/dev/null || true
-wait "$innocent_pid" 2>/dev/null || true
-assert_absent "$FM_PROCEVENT_CLAIM_ROOT/reused-src.claim" "retirement releases the exact reused-pid claim"
-pass "detected PID reuse is refused before signalling"
+test_reused_claim_preserves_innocent_process
 
 HL="$TMP_ROOT/hl"; new_home "$HL"
 IDENTITY_TRIGGER="$TMP_ROOT/identity-trigger"
@@ -3616,6 +3644,7 @@ pe "$HPACE" retire pace-src >/dev/null
 pe_register "$HPACE" lavish pace-src -- "$FAST_SOURCE" "$PACE_LOG" >/dev/null
 FM_PROCEVENT_LAUNCH_FLOOR_SECONDS=3600 pe "$HPACE" start pace-src > "$TMP_ROOT/replacement-pacing.out" 2>&1 &
 PACE_START_PID=$!
+fm_test_track_pid "$PACE_START_PID" || ! kill -0 "$PACE_START_PID" 2>/dev/null || fail "could not register fixture process cleanup"
 pace_deadline=$((SECONDS + 4))
 while kill -0 "$PACE_START_PID" 2>/dev/null; do
   if [ "$SECONDS" -ge "$pace_deadline" ]; then
@@ -3644,6 +3673,7 @@ FM_PROCEVENT_LAUNCH_FLOOR_SECONDS=3 pe "$HPACE_RACE" start pace-race-src >/dev/n
 FM_PROCEVENT_LAUNCH_FLOOR_SECONDS=15 \
   pe "$HPACE_RACE" start pace-race-src > "$TMP_ROOT/registration-pacing-race.out" 2>&1 &
 PACE_RACE_PID=$!
+fm_test_track_pid "$PACE_RACE_PID" || ! kill -0 "$PACE_RACE_PID" 2>/dev/null || fail "could not register fixture process cleanup"
 wait_for "$FM_PROCEVENT_CLAIM_ROOT/pace-race-src.claim" \
   || fail "the superseded pacing fixture did not claim its registration"
 [ "$(wc -l < "$PACE_RACE_LOG" | tr -d ' ')" = 1 ] \
@@ -3690,6 +3720,7 @@ done
 printf '%s\n' "$(( $(date +%s) + 3600 ))" > "$ROLLBACK_STAMP"
 FM_PROCEVENT_LAUNCH_FLOOR_SECONDS=3600 pe "$HROLLBACK" start rollback-src > "$TMP_ROOT/rollback.out" 2>&1 &
 ROLLBACK_START_PID=$!
+fm_test_track_pid "$ROLLBACK_START_PID" || ! kill -0 "$ROLLBACK_START_PID" 2>/dev/null || fail "could not register fixture process cleanup"
 rollback_deadline=$((SECONDS + 4))
 while kill -0 "$ROLLBACK_START_PID" 2>/dev/null; do
   if [ "$SECONDS" -ge "$rollback_deadline" ]; then
@@ -3758,6 +3789,7 @@ pe_register "$HATTACHED" lavish attached-src -- "$BLOCKER" "$ATTACHED_TRIGGER" "
 FM_PROCEVENT_OWNER_LEASE_SECONDS=1 FM_PROCEVENT_OWNER_CHECK_SECONDS=1 \
   pe "$HATTACHED" start attached-src > "$TMP_ROOT/attached.out" 2>&1 &
 ATTACHED_START_PID=$!
+fm_test_track_pid "$ATTACHED_START_PID" || ! kill -0 "$ATTACHED_START_PID" 2>/dev/null || fail "could not register fixture process cleanup"
 wait_for "$HATTACHED/state/procevent/attached-src.runner" \
   || fail "the attached start never launched its source"
 sleep 4
@@ -3795,6 +3827,7 @@ pe_register "$HCLOCK" lavish lease-clock-src -- \
 PATH="$CLOCK_BIN:$PATH" FM_PROCEVENT_OWNER_LEASE_SECONDS=1 FM_PROCEVENT_OWNER_CHECK_SECONDS=1 \
   pe "$HCLOCK" start lease-clock-src > "$TMP_ROOT/lease-clock.out" 2>&1 &
 CLOCK_START_PID=$!
+fm_test_track_pid "$CLOCK_START_PID" || ! kill -0 "$CLOCK_START_PID" 2>/dev/null || fail "could not register fixture process cleanup"
 wait_for "$HCLOCK/state/procevent/lease-clock-src.runner" \
   || fail "the clock-shift fixture never launched its source"
 sleep 4
@@ -3814,6 +3847,7 @@ FM_PROCEVENT_OWNER_LEASE_SECONDS=1 FM_PROCEVENT_OWNER_CHECK_SECONDS=1 FM_HOME="$
     "$ROOT/bin/fm-procevent.sh" start detached-attached-src \
     > "$TMP_ROOT/detached-attached.out" 2>&1 &
 DETACHED_START_PID=$!
+fm_test_track_pid "$DETACHED_START_PID" || ! kill -0 "$DETACHED_START_PID" 2>/dev/null || fail "could not register fixture process cleanup"
 wait_for "$HDETACHED/state/procevent/detached-attached-src.runner" \
   || fail "the detachable foreground start never launched its source"
 DETACHED_RUNNER_PID=$(cat "$HDETACHED/state/procevent/detached-attached-src.runner")
@@ -3896,6 +3930,7 @@ marker=$1
     printf 'tick\n' >> "$marker.ticks"
     sleep 0.1
   done ) &
+fm_test_track_pid "$!" || exit 70
 printf '%s\n' "$!" > "$marker.descendant"
 while [ ! -e "$marker.trigger" ]; do
   [ "$SECONDS" -lt "${FM_TEST_STUB_MAX_BLOCK_SECONDS:-120}" ] || exit 75
@@ -3918,6 +3953,7 @@ cat > "$QUIET_STUB" <<'SH'
 #!/usr/bin/env bash
 marker=$1
 ( sleep "${FM_TEST_STUB_MAX_BLOCK_SECONDS:-120}" ) &
+fm_test_track_pid "$!" || exit 70
 printf '%s\n' "$!" > "$marker.descendant"
 while [ ! -e "$marker.trigger" ]; do
   [ "$SECONDS" -lt "${FM_TEST_STUB_MAX_BLOCK_SECONDS:-120}" ] || exit 75
@@ -4187,6 +4223,7 @@ PL
       pe "$HPROOF" start proof-src >"$HPROOF/start.log" 2>&1 &
   fi
   PROOF_START=$!
+  fm_test_track_pid "$PROOF_START" || ! kill -0 "$PROOF_START" 2>/dev/null || fail "could not register fixture process cleanup"
   wait_for "$HPROOF/state/procevent/proof-src.runner" \
     || fail "the signal-proof listener never recorded its runner"
   PROOF_PID=$(cat "$HPROOF/state/procevent/proof-src.runner")
@@ -4195,6 +4232,7 @@ PL
   FM_PROC_ROOT_OVERRIDE="$TMP_ROOT/no-proof-proc" \
     pe "$HPROOF" retire proof-src >"$HPROOF/retire.log" 2>&1 &
   PROOF_STOP=$!
+  fm_test_track_pid "$PROOF_STOP" || ! kill -0 "$PROOF_STOP" 2>/dev/null || fail "could not register fixture process cleanup"
   proof_transition=0
   for _ in $(seq 1 100); do
     if [ "$proof_state" = zombie ]; then
@@ -4556,6 +4594,7 @@ HPROMPT="$TMP_ROOT/prompt-stop"; new_home "$HPROMPT"
 pe_register "$HPROMPT" lavish prompt-src -- "$QUIET_STUB" "$TMP_ROOT/prompt-stop" >/dev/null
 pe "$HPROMPT" start prompt-src >"$TMP_ROOT/prompt-start.log" 2>&1 &
 PROMPT_START_PID=$!
+fm_test_track_pid "$PROMPT_START_PID" || ! kill -0 "$PROMPT_START_PID" 2>/dev/null || fail "could not register fixture process cleanup"
 wait_for "$HPROMPT/state/procevent/prompt-src.runner" \
   || fail "the promptly-stopping listener never recorded its runner"
 PROMPT_PID=$(cat "$HPROMPT/state/procevent/prompt-src.runner")
@@ -4676,6 +4715,7 @@ wait_for "$delay_ready" || fail "delayed-start fixture could not hold the source
 PATH="$DELAY/bin:$PATH" FM_HOME="$DELAY/home" \
   "$ROOT/bin/fm-procevent-lavish.sh" arm "$delay_art" > "$DELAY/arm.out" 2>"$DELAY/arm.err" &
 delay_arm=$!
+fm_test_track_pid "$delay_arm" || ! kill -0 "$delay_arm" 2>/dev/null || fail "could not register fixture process cleanup"
 sleep 0.4
 assert_not_contains "$(cat "$DELAY/arm.out" 2>/dev/null || true)" "armed:" \
   "arm reported ready while the listener could not start"
@@ -5060,6 +5100,7 @@ done
 # meets it still held, then release it partway through the confirm window.
 setsid sleep 60 &
 drain_holder=$!
+fm_test_track_pid "$drain_holder" || ! kill -0 "$drain_holder" 2>/dev/null || fail "could not register fixture process cleanup"
 # Read the identity only once the holder has exec'd sleep: mid-exec its cmdline
 # can read empty, and a pre-exec identity would never match the live holder.
 for _ in $(seq 1 100); do
@@ -5078,6 +5119,7 @@ PATH="$DRAIN/bin:$PATH" FM_HOME="$DRAIN/home" FM_PROCEVENT_LAUNCH_CONFIRM_SECOND
   "$ROOT/bin/fm-procevent-lavish.sh" arm "$drain_art" --for worker-drain \
   --agent-reply-file "$DRAIN/reply2" > "$DRAIN/arm2.out" 2> "$DRAIN/arm2.err" &
 drain_arm=$!
+fm_test_track_pid "$drain_arm" || ! kill -0 "$drain_arm" 2>/dev/null || fail "could not register fixture process cleanup"
 sleep 1
 kill -KILL "$drain_holder" 2>/dev/null || true
 wait "$drain_holder" 2>/dev/null || true
