@@ -304,10 +304,13 @@ start_viewer_fixture() {
   local pair=$1
   (
     "$REAL_SLEEP" 20 &
-    printf '%s\n' "$!" > "$pair"
+    local viewer=$!
+    fm_test_track_pid "$viewer" || ! kill -0 "$viewer" 2>/dev/null || fail "could not register viewer child cleanup"
+    printf '%s\n' "$viewer" > "$pair"
     wait
   ) &
   FIXTURE_LAUNCHER_PID=$!
+  fm_test_track_pid "$FIXTURE_LAUNCHER_PID" || ! kill -0 "$FIXTURE_LAUNCHER_PID" 2>/dev/null || fail "could not register fixture process cleanup"
   while [ ! -s "$pair" ]; do
     "$REAL_SLEEP" 0.01
   done
@@ -360,6 +363,7 @@ SH
     FM_FAKE_VIEWER_TERMINATING="$terminating" FM_FAKE_VIEWER_COMPLETED="$completed" \
     "$FAKEBIN/viewer-launcher" &
   launcher_pid=$!
+  fm_test_track_pid "$launcher_pid" || ! kill -0 "$launcher_pid" 2>/dev/null || fail "could not register fixture process cleanup"
   while [ ! -f "$started" ]; do
     "$REAL_SLEEP" 0.01
   done
@@ -417,6 +421,7 @@ test_viewer_stop_only_signals_owned_processes() {
 
   sleep 20 &
   holder_pid=$!
+  fm_test_track_pid "$holder_pid" || ! kill -0 "$holder_pid" 2>/dev/null || fail "could not register fixture process cleanup"
   printf 'launcher_pid=%s\nlauncher_start=not-this-process\nviewer_pid=%s\nviewer_start=not-this-process\n' \
     "$holder_pid" "$holder_pid" > "$record"
   printf '%s\n' no_foreground_client > "$FAKE_STATE/$name.foreground"
@@ -437,8 +442,10 @@ test_viewer_stop_requires_the_recorded_parent() {
   record=$(run_with_fake fm_herdr_lab_viewer_record_path "$name")
   sleep 20 &
   launcher_pid=$!
+  fm_test_track_pid "$launcher_pid" || ! kill -0 "$launcher_pid" 2>/dev/null || fail "could not register fixture process cleanup"
   sleep 20 &
   viewer_pid=$!
+  fm_test_track_pid "$viewer_pid" || ! kill -0 "$viewer_pid" 2>/dev/null || fail "could not register fixture process cleanup"
   write_viewer_record "$record" "$launcher_pid" "$viewer_pid"
   printf '%s\n' no_foreground_client > "$FAKE_STATE/$name.foreground"
   run_with_fake fm_herdr_lab_viewer_stop "$name" || fail "parent-mismatch stop failed"
@@ -468,6 +475,7 @@ SH
     FM_FAKE_VIEWER_SESSION="$name" run_with_fake exec "$ROOT/bin/fm-herdr-lab.sh" \
     viewer start "$name" >/dev/null 2>&1 &
   command_pid=$!
+  fm_test_track_pid "$command_pid" || ! kill -0 "$command_pid" 2>/dev/null || fail "could not register fixture process cleanup"
   while [ ! -f "$started" ]; do
     "$REAL_SLEEP" 0.01
   done
@@ -533,6 +541,11 @@ test_viewer_launcher_refuses_unsafe_arguments() {
   assert_absent "$TMP_ROOT/pid" "a refused launch still wrote a pid record"
   pass "fm-herdr-lab: the viewer launcher refuses unsafe sessions and pidfiles"
 }
+
+# Failure-unwind regressions load fixtures without running the suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
 
 test_refuses_unsafe_names
 test_provision_run_and_guarded_teardown

@@ -11,6 +11,47 @@ TEARDOWN="$ROOT/bin/fm-teardown.sh"
 TMP_ROOT=$(fm_test_tmproot fm-teardown-endpoint-safety)
 REAL_TMUX=$(command -v tmux || true)
 
+PRIVATE_TMUX_DIRS=()
+PRIVATE_TMUX_SOCKETS=()
+PRIVATE_TMUX_PIDS=()
+PRIVATE_TMUX_IDENTITIES=()
+
+start_isolated_tmux() {  # <dir> <socket> <new-session arguments...>
+  local dir=$1 socket=$2 server identity
+  shift 2
+  # -P returns the creation-time server PID before any later fixture setup.
+  server=$(cd "$dir" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$socket" \
+    new-session -d -P -F '#{pid}' "$@") || fail "could not start private tmux server"
+  identity=$(fm_test_pid_start_time "$server") || fail "could not identify private tmux server"
+  PRIVATE_TMUX_DIRS+=("$dir")
+  PRIVATE_TMUX_SOCKETS+=("$socket")
+  PRIVATE_TMUX_PIDS+=("$server")
+  PRIVATE_TMUX_IDENTITIES+=("$identity")
+}
+
+cleanup_private_tmux() {
+  local rc=$? i dir socket server expected live socket_pid
+  for ((i=0; i<${#PRIVATE_TMUX_PIDS[@]}; i++)); do
+    dir=${PRIVATE_TMUX_DIRS[i]}
+    socket=${PRIVATE_TMUX_SOCKETS[i]}
+    server=${PRIVATE_TMUX_PIDS[i]}
+    expected=${PRIVATE_TMUX_IDENTITIES[i]}
+    live=$(fm_test_pid_start_time "$server" 2>/dev/null) || continue
+    [ "$live" = "$expected" ] || continue
+    socket_pid=$(cd "$dir" && "$REAL_TMUX" -S "$socket" display-message -p '#{pid}' 2>/dev/null) || continue
+    [ "$socket_pid" = "$server" ] || continue
+    # Use only this fixture's socket, after both birth and socket identity agree.
+    (cd "$dir" && "$REAL_TMUX" -S "$socket" kill-server 2>/dev/null) || true
+  done
+  fm_test_cleanup
+  return "$rc"
+}
+trap cleanup_private_tmux EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+trap 'exit 131' QUIT
+
 make_case() {  # <name>
   local dir=$1
   mkdir -p "$TMP_ROOT/$dir/home/state" "$TMP_ROOT/$dir/home/data" \
@@ -39,7 +80,7 @@ SH
 
 mark_case_as_treehouse_pool() {  # <case>
   local dir=$1
-  rm -rf "$dir/worktree"
+  fm_test_remove_tree "$dir/worktree"
   mkdir -p "$dir/pool/1"
   git -C "$dir/project" -c user.name=test -c user.email=test@example.invalid \
     commit --allow-empty -qm pool-fixture
@@ -128,6 +169,7 @@ test_control_lock_contention_refuses_before_mutation() {
     sleep 30
   ) &
   holder=$!
+  fm_test_track_pid "$holder" || ! kill -0 "$holder" 2>/dev/null || fail "could not register fixture process cleanup"
   while [ ! -e "$lock" ] && [ "$i" -lt 100 ]; do
     sleep 0.1
     i=$((i + 1))
@@ -175,6 +217,7 @@ test_non_pool_teardown_ignores_task_set_lock() {
     sleep 30
   ) &
   holder=$!
+  fm_test_track_pid "$holder" || ! kill -0 "$holder" 2>/dev/null || fail "could not register fixture process cleanup"
   while [ ! -e "$ready" ] && [ "$i" -lt 100 ]; do
     sleep 0.1
     i=$((i + 1))
@@ -214,6 +257,7 @@ test_metadata_lock_serializes_destructive_cleanup() {
     done
   ) &
   holder=$!
+  fm_test_track_pid "$holder" || ! kill -0 "$holder" 2>/dev/null || fail "could not register fixture process cleanup"
   while [ ! -e "$ready" ] && [ "$i" -lt 100 ]; do
     sleep 0.1
     i=$((i + 1))
@@ -226,6 +270,7 @@ test_metadata_lock_serializes_destructive_cleanup() {
 
   run_case "$dir" "$id" > "$dir/stdout" 2> "$dir/stderr" &
   teardown_pid=$!
+  fm_test_track_pid "$teardown_pid" || ! kill -0 "$teardown_pid" 2>/dev/null || fail "could not register fixture process cleanup"
   sleep 0.2
   if ! kill -0 "$teardown_pid" 2>/dev/null; then
     : > "$release"
@@ -392,8 +437,10 @@ test_recorded_process_identity_cleanup_is_exact() {
   dir=$(make_case recorded-process)
   sleep 30 &
   control_pid=$!
+  fm_test_track_pid "$control_pid" || ! kill -0 "$control_pid" 2>/dev/null || fail "could not register fixture process cleanup"
   sleep 30 &
   target_pid=$!
+  fm_test_track_pid "$target_pid" || ! kill -0 "$target_pid" 2>/dev/null || fail "could not register fixture process cleanup"
   printf '%s\n' "$control_pid" > "$dir/control.pid"
   printf '%s\n' "$target_pid" > "$dir/target.pid"
   target_record=$(cat "$dir/target.pid")
@@ -423,7 +470,7 @@ test_isolated_tmux_invalid_and_valid_cleanup() {
   dir=$(make_case isolated-real)
   socket=dedicated.sock
   socket_id="$dir/$socket"
-  ( cd "$dir" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$socket" new-session -d -s "$session" -n "$control" )
+  start_isolated_tmux "$dir" "$socket" -s "$session" -n "$control"
   ( cd "$dir" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$socket" new-window -d -t "$session:" -n "$target" )
   printf '%s\n' "$socket_id" > "$dir/socket.identity"
   cat > "$dir/fakebin/tmux" <<SH
@@ -538,7 +585,7 @@ test_reused_pool_slot_refuses_before_touching_the_other_task() {
   # alive in the slot while teardown runs.
   ( cd "$dir/worktree" && exec sleep 30 ) &
   worker=$!
-
+  fm_test_track_pid "$worker" || ! kill -0 "$worker" 2>/dev/null || fail "could not register fixture process cleanup"
   set +e
   run_case "$dir" "$id" > "$dir/stdout" 2> "$dir/stderr"
   rc=$?
@@ -647,7 +694,7 @@ test_sole_slot_record_still_tears_down() {
     "worktree=$dir/other-worktree" "project=$dir/project" "kind=scout"
   ( cd "$dir/other-worktree" && exec sleep 30 ) &
   worker=$!
-
+  fm_test_track_pid "$worker" || ! kill -0 "$worker" 2>/dev/null || fail "could not register fixture process cleanup"
   run_case "$dir" "$id" > "$dir/stdout" 2> "$dir/stderr" \
     || fail "teardown of a task that solely holds its slot failed: $(cat "$dir/stderr")"
   assert_absent "$dir/home/state/$id.meta" "uncontested teardown left the task record"
@@ -896,6 +943,7 @@ test_remote_layout_homes_serialize_on_one_project_lock() {
     '. "$1"; fm_lock_try_acquire "$2" || exit 1; : > "$3"; exec sleep 30' _ \
     "$ROOT/bin/fm-wake-lib.sh" "$lock" "$dir/lock-held" &
   holder=$!
+  fm_test_track_pid "$holder" || ! kill -0 "$holder" 2>/dev/null || fail "could not register fixture process cleanup"
   while [ ! -e "$dir/lock-held" ] && [ "$waited" -lt 100 ]; do
     kill -0 "$holder" 2>/dev/null || break
     sleep 0.1
@@ -971,7 +1019,7 @@ test_reassigned_pool_slot_finishes_own_cleanup_without_touching_the_slot() {
   # alive in the slot while teardown runs.
   ( cd "$dir/worktree" && exec sleep 30 ) &
   worker=$!
-
+  fm_test_track_pid "$worker" || ! kill -0 "$worker" 2>/dev/null || fail "could not register fixture process cleanup"
   set +e
   run_case "$dir" "$id" > "$dir/stdout" 2> "$dir/stderr"
   rc=$?
@@ -1002,7 +1050,7 @@ test_reassigned_pool_slot_finishes_own_cleanup_without_touching_the_slot() {
   claim_pool_slot "$dir" "$other" "$dir/other-home"
   ( cd "$dir/worktree" && exec sleep 30 ) &
   worker=$!
-
+  fm_test_track_pid "$worker" || ! kill -0 "$worker" 2>/dev/null || fail "could not register fixture process cleanup"
   set +e
   FM_HOME="$dir/home" FM_ROOT_OVERRIDE="$ROOT" \
   FM_RUNTIME_LOG="$dir/runtime.log" PATH="$dir/fakebin:$PATH" \
@@ -1201,7 +1249,7 @@ test_failed_endpoint_close_refuses_before_removing_the_record() {
   [ -n "$REAL_TMUX" ] || { echo "skip - tmux not installed"; return 0; }
   dir=$(make_case close-failure)
   socket=dedicated.sock
-  ( cd "$dir" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$socket" new-session -d -s "$session" -n control )
+  start_isolated_tmux "$dir" "$socket" -s "$session" -n control
   ( cd "$dir" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$socket" new-window -d -t "=$session:" -n "fm-$id" )
   write_close_failing_tmux_shim "$dir" "$socket" "$REAL_TMUX"
   isolated_tmux_window_exists "$dir" "$socket" "$session" "fm-$id" \
@@ -1261,7 +1309,7 @@ test_forced_teardown_continues_past_a_close_it_could_not_make() {
   [ -n "$REAL_TMUX" ] || { echo "skip - tmux not installed"; return 0; }
   dir=$(make_case forced-close-failure)
   socket=dedicated.sock
-  ( cd "$dir" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$socket" new-session -d -s "$session" -n control )
+  start_isolated_tmux "$dir" "$socket" -s "$session" -n control
   ( cd "$dir" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$socket" new-window -d -t "=$session:" -n "fm-$id" )
   write_close_failing_tmux_shim "$dir" "$socket" "$REAL_TMUX"
   write_endpoint_close_meta "$dir" "$id" "$session:fm-$id"
@@ -1312,7 +1360,7 @@ test_unreadable_close_read_refuses_while_a_definitive_absence_completes() {
   # all. Nothing here shows the window absent, so treating it as closed would
   # strand exactly the endpoint the refusal exists to keep named.
   dir=$(make_case unreadable-close-read)
-  ( cd "$dir" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$socket" new-session -d -s "$session" -n control )
+  start_isolated_tmux "$dir" "$socket" -s "$session" -n control
   ( cd "$dir" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$socket" new-window -d -t "=$session:" -n "fm-$id" )
   write_close_failing_tmux_shim "$dir" "$socket" "$REAL_TMUX"
   write_endpoint_close_meta "$dir" "$id" "$session:fm-$id"
@@ -1339,7 +1387,7 @@ test_unreadable_close_read_refuses_while_a_definitive_absence_completes() {
   # or its whole server, is absent is proof the window is gone, so an endpoint
   # that outlived its session is still ordinary silent cleanup.
   dir=$(make_case missing-session-close-read)
-  ( cd "$dir" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$socket" new-session -d -s survivor -n control )
+  start_isolated_tmux "$dir" "$socket" -s survivor -n control
   write_close_failing_tmux_shim "$dir" "$socket" "$REAL_TMUX"
   write_endpoint_close_meta "$dir" "$id" "gone session:fm-$id"
   env -u TMUX -u TMUX_PANE FM_TEST_BLOCK_KILL=1 \
@@ -1382,7 +1430,7 @@ test_forced_secondmate_child_close_failure_still_refuses() {
   mate="$dir/mate"
   mkdir -p "$mate/state" "$mate/data" "$mate/config"
   printf '%s' "$parent" > "$mate/.fm-secondmate-home"
-  ( cd "$dir" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$socket" new-session -d -s "$session" -n control )
+  start_isolated_tmux "$dir" "$socket" -s "$session" -n control
   ( cd "$dir" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$socket" new-window -d -t "=$session:" -n "fm-$child" )
   write_close_failing_tmux_shim "$dir" "$socket" "$REAL_TMUX"
   fm_write_meta "$dir/home/state/$parent.meta" \
@@ -1479,7 +1527,7 @@ test_already_gone_endpoint_still_completes_without_a_refusal() {
   [ -n "$REAL_TMUX" ] || { echo "skip - tmux not installed"; return 0; }
   dir=$(make_case already-gone)
   socket=dedicated.sock
-  ( cd "$dir" && env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$socket" new-session -d -s "$session" -n control )
+  start_isolated_tmux "$dir" "$socket" -s "$session" -n control
   write_close_failing_tmux_shim "$dir" "$socket" "$REAL_TMUX"
   # The whole point of this case: the recorded window has already exited, so
   # its close cannot succeed and must still be the ordinary silent cleanup.
@@ -1515,6 +1563,11 @@ test_already_gone_endpoint_still_completes_without_a_refusal() {
 
   pass "fm-teardown: an already-exited endpoint, and a server that is already gone, still complete cleanup silently"
 }
+
+# Failure-unwind regressions load fixtures without running the suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
 
 test_invalid_endpoint_records_refuse_before_mutation
 test_control_lock_contention_refuses_before_mutation

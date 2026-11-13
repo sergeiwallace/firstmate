@@ -15,6 +15,9 @@ set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# Nested fixture shells share their owner's process cleanup registry.
+export FM_TEST_PID_REGISTRY
+export -f fm_test_track_pid fm_test_pid_start_time
 
 LINT="$ROOT/bin/fm-lint.sh"
 INSTALLER="$ROOT/bin/fm-install-shellcheck.sh"
@@ -367,7 +370,9 @@ target=${!#}
 case "$target" in
   *blocker*)
     sleep "${FM_TEST_BLOCK_SECS:-300}" &
-    printf '%s\n' "$!" > "${FM_TEST_CHILD_PID:-/dev/null}"
+    child=$!
+    fm_test_track_pid "$child" || exit 70
+    printf '%s\n' "$child" > "${FM_TEST_CHILD_PID:-/dev/null}"
     printf '%s\n' "$$" > "${FM_TEST_STUB_PID:-/dev/null}"
     exec sleep "${FM_TEST_BLOCK_SECS:-300}"
     ;;
@@ -870,6 +875,7 @@ test_local_exclusion_list_covers_every_no_external_sources_code() {
   for path in "${files[@]}"; do
     i=$((i + 1))
     fm_lint_nox_one_root "$i" "$path" "$tmp/gcc" &
+    fm_test_track_pid "$!" || ! kill -0 "$!" 2>/dev/null || fail "could not register lint worker cleanup"
     batch=$((batch + 1))
     if [ "$batch" -eq 4 ]; then
       wait
@@ -943,7 +949,7 @@ test_installer_selects_platform_archive_url_and_checksum() {
 
   while IFS=$'\t' read -r uname_s uname_m archive sha; do
     [ -n "$uname_s" ] || continue
-    rm -rf "$destination"
+    fm_test_remove_tree "$destination"
     : > "$url_log"
     out=$(CURL_URL_LOG="$url_log" SHA256_STUB_HASH="$sha" \
       FM_TEST_UNAME_S="$uname_s" FM_TEST_UNAME_M="$uname_m" \
@@ -1383,6 +1389,7 @@ SH
         FM_LINT_TELEMETRY="$telemetry_file" FM_TEST_SHELLCHECK_PID="$pid_file" \
         "$LINT" "$fixture" > "$out_file" 2>&1 &
       parent_pid=$!
+      fm_test_track_pid "$parent_pid" || ! kill -0 "$parent_pid" 2>/dev/null || fail "could not register fixture process cleanup"
       i=0
       while [ "$i" -lt 500 ] && [ ! -s "$pid_file" ]; do
         kill -0 "$parent_pid" 2>/dev/null || break
@@ -1442,6 +1449,7 @@ test_root_deadline_names_the_root_and_reaps_the_tree() {
 
   sleep 300 &
   sentinel_pid=$!
+  fm_test_track_pid "$sentinel_pid" || ! kill -0 "$sentinel_pid" 2>/dev/null || fail "could not register fixture process cleanup"
   rc=0
   out=$(PATH="$fakebin:$PATH" FM_LINT_JOBS=1 \
     FM_LINT_REQUIRE_BOUNDS=1 \
@@ -1512,6 +1520,7 @@ test_root_memory_limit_reports_a_named_death() {
   # the allocator is refused and the run must name the root, not survive.
   sleep 300 &
   sentinel_pid=$!
+  fm_test_track_pid "$sentinel_pid" || ! kill -0 "$sentinel_pid" 2>/dev/null || fail "could not register fixture process cleanup"
   rc=0
   out=$(PATH="$fakebin:$PATH" FM_LINT_JOBS=1 \
     FM_LINT_REQUIRE_BOUNDS=1 FM_LINT_ROOT_MEMORY_KIB=262144 \
@@ -2025,6 +2034,11 @@ SH
     || fail "the test boundary re-imported the production-owner diagnostic"
   pass "seeded dispatcher, adapter, production-owner, and test-local diagnostics preserve parity"
 }
+
+# Failure-unwind regressions load fixtures without running the suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
 
 test_help_reports_the_complete_interface
 test_list_files_reports_the_shell_inventory

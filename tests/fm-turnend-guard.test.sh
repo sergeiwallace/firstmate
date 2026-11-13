@@ -352,6 +352,7 @@ test_hook_silent_with_live_lock_and_fresh_beacon() {
   : > "$dir/state/task1.meta"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   identity=$(watcher_identity "$dir" "$pid") || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -374,6 +375,7 @@ test_hook_non_claude_health_ignores_claude_budget_contention() {
   : > "$dir/state/task1.meta"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   identity=$(watcher_identity "$dir" "$pid") || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -386,6 +388,7 @@ test_hook_non_claude_health_ignores_claude_budget_contention() {
   printf 'alarm-state\n' > "$dir/state/.claude-autoarm-failure-alarmed"
   sleep 60 &
   holder=$!
+  fm_test_track_pid "$holder" || ! kill -0 "$holder" 2>/dev/null || fail "could not register fixture process cleanup"
   mkdir -p "$dir/state/.turnend-claude-blocks.lock"
   printf '%s\n' "$holder" > "$dir/state/.turnend-claude-blocks.lock/pid"
   while IFS='|' read -r harness payload; do
@@ -421,6 +424,7 @@ test_hook_blocks_with_live_lock_and_stale_beacon() {
   : > "$dir/state/task1.meta"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   identity=$(watcher_identity "$dir" "$pid") || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -582,6 +586,7 @@ test_hook_secondmate_reinvoke_recovery_loop() {
   : > "$dir/state/child1.meta"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   identity=$(watcher_identity "$dir" "$pid") || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -601,7 +606,7 @@ test_hook_secondmate_reinvoke_recovery_loop() {
   # not, the guard blocks that turn's end and forces the re-arm (Stop #2).
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  rm -rf "$dir/state/.watch.lock"
+  fm_test_remove_tree "$dir/state/.watch.lock"
   : > "$dir/state/child2.meta"
   touch "$dir/state/.last-watcher-beat"
   out=$(run_hook "$dir" false); status=$?
@@ -1473,6 +1478,7 @@ test_hook_claude_mode_allows_when_autoarm_owner_alive() {
   seed_claude_budget "$dir" 3
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   record_autoarm_owner "$dir" "$pid"
   out=$(run_hook_claude "$dir" false); status=$?
   count=$(sed -n '2s/^count=//p' "$dir/state/.turnend-claude-blocks")
@@ -1505,6 +1511,7 @@ test_hook_claude_mode_repeated_failed_to_arming_interleavings_reach_fail_open() 
     epoch=$((epoch + 1))
     sleep 60 &
     pid=$!
+    fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
     record_autoarm_owner "$dir" "$pid"
     printf 'epoch=%s owner_pid=%s outcome=arming updated_at=%s\n' "$epoch" "$pid" "$(date +%s)" > "$dir/state/.claude-autoarm-epoch"
     out=$(run_hook_claude "$dir" true); status=$?
@@ -1513,7 +1520,7 @@ test_hook_claude_mode_repeated_failed_to_arming_interleavings_reach_fail_open() 
     [ "$count" = "$i" ] || fail "arming epoch $i produced non-monotonic count $count"
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
-    rm -rf "$dir/state/.claude-autoarm.lock"
+    fm_test_remove_tree "$dir/state/.claude-autoarm.lock"
     epoch=$((epoch + 1))
     printf 'epoch=%s owner_pid=999 outcome=failed-suppressed updated_at=%s\n' "$epoch" "$(date +%s)" > "$dir/state/.claude-autoarm-epoch"
   done
@@ -1565,6 +1572,7 @@ SH
     printf '%s\n' "$?" > "$guard_status"
   ) &
   guard_pid=$!
+  fm_test_track_pid "$guard_pid" || ! kill -0 "$guard_pid" 2>/dev/null || fail "could not register fixture process cleanup"
   IFS= read -r _ < "$ready"
   auto_out=$(run_integrated_autoarm "$dir"); auto_status=$?
   printf 'release\n' > "$release"
@@ -1601,6 +1609,7 @@ test_hook_claude_mode_blocks_on_abandoned_autoarm_claim() {
   : > "$dir/state/task2.meta"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   record_autoarm_owner "$dir" "$pid"
   printf 'epoch=464 owner_pid=%s outcome=rewake updated_at=1\n' "$pid" > "$dir/state/.claude-autoarm-epoch"
   touch -t 202001010000 "$dir/state/.claude-autoarm-epoch"
@@ -1625,6 +1634,7 @@ test_hook_claude_mode_blocks_on_pid_reused_arming_claim() {
   : > "$dir/state/task2.meta"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   record_autoarm_owner "$dir" "$pid"
   # The claim recorded ITS OWN identity; this test shell now stands in for the
   # unrelated process that inherited the number.
@@ -1652,6 +1662,7 @@ test_hook_claude_mode_blocks_on_stuck_arming_claim() {
   : > "$dir/state/task2.meta"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   record_autoarm_owner "$dir" "$pid"
   identity=$(fm_test_pid_identity "$pid") || fail "could not compute a claim pid-identity"
   printf '%s\n' "$identity" > "$dir/state/.claude-autoarm.lock/pid-identity"
@@ -1677,6 +1688,7 @@ test_hook_claude_mode_allows_on_open_generation_claim() {
   printf '%s\n' "$$" > "$dir/state/.lock"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   identity=$(fm_test_pid_identity "$pid") || fail "could not compute a claim pid-identity"
   printf 'epoch=464 owner_pid=%s outcome=arming updated_at=1\n%s\n' "$pid" "$identity" \
     > "$dir/state/.claude-autoarm-epoch"
@@ -1700,6 +1712,7 @@ test_hook_claude_mode_blocks_on_stuck_generation_claim() {
   : > "$dir/state/task2.meta"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   identity=$(fm_test_pid_identity "$pid") || fail "could not compute a claim pid-identity"
   printf 'epoch=464 owner_pid=%s outcome=arming updated_at=1\n%s\n' "$pid" "$identity" \
     > "$dir/state/.claude-autoarm-epoch"
@@ -1725,6 +1738,7 @@ test_hook_claude_mode_terminal_fail_open_clears_abandoned_claim() {
   seed_claude_budget "$dir" 4 3
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   record_autoarm_owner "$dir" "$pid"
   printf 'epoch=3 owner_pid=%s outcome=failed-suppressed updated_at=1\n' "$pid" > "$dir/state/.claude-autoarm-epoch"
   touch -t 202001010000 "$dir/state/.claude-autoarm-epoch"
@@ -1799,6 +1813,7 @@ test_hook_claude_mode_integrated_monotonic_fail_open() {
 
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   identity=$(watcher_identity "$dir" "$pid") || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -1809,7 +1824,7 @@ test_hook_claude_mode_integrated_monotonic_fail_open() {
   out=$(run_integrated_autoarm "$dir"); status=$?
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  rm -rf "$dir/state/.watch.lock"
+  fm_test_remove_tree "$dir/state/.watch.lock"
   expect_code 0 "$status" "positive watcher recovery must make the auto-arm silent"
   assert_absent "$dir/state/.claude-autoarm-failure-notified" "positive recovery left the failure notice marker"
   assert_absent "$dir/state/.claude-autoarm-failure-alarmed" "positive recovery left the attended alarm marker"
@@ -1874,6 +1889,7 @@ test_hook_claude_mode_frozen_epoch_reaches_bounded_fail_open() {
   # healthy watcher still lets the stop through and clears the whole episode.
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   identity=$(watcher_identity "$dir" "$pid") || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -1884,7 +1900,7 @@ test_hook_claude_mode_frozen_epoch_reaches_bounded_fail_open() {
   guard_out=$(run_hook_claude "$dir" true); guard_status=$?
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  rm -rf "$dir/state/.watch.lock"
+  fm_test_remove_tree "$dir/state/.watch.lock"
   expect_code 0 "$guard_status" "a healthy watcher must still allow the stop after a frozen-epoch alarm"
   [ -z "$guard_out" ] || fail "healthy allow after the frozen-epoch alarm produced output: $guard_out"
   assert_absent "$dir/state/.turnend-claude-blocks" "positive recovery left the frozen-epoch block budget"
@@ -1928,11 +1944,13 @@ test_hook_claude_mode_recovery_contention_is_not_ordinary_allow() {
   : > "$dir/state/.claude-autoarm-failure-alarmed"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   identity=$(watcher_identity "$dir" "$pid") || fail "could not identify recovery-contention watcher"
   record_watcher_lock "$dir" "$pid" "$identity"
   touch "$dir/state/.last-watcher-beat"
   sleep 60 &
   holder=$!
+  fm_test_track_pid "$holder" || ! kill -0 "$holder" 2>/dev/null || fail "could not register fixture process cleanup"
   mkdir -p "$dir/state/.turnend-claude-blocks.lock"
   printf '%s\n' "$holder" > "$dir/state/.turnend-claude-blocks.lock/pid"
   out=$(run_hook_claude "$dir" false); status=$?
@@ -1964,13 +1982,16 @@ test_hook_claude_mode_concurrent_recovery_resets_are_idempotent() {
   : > "$dir/state/.claude-autoarm-failure-alarmed"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   identity=$(watcher_identity "$dir" "$pid") || fail "could not identify concurrent recovery watcher"
   record_watcher_lock "$dir" "$pid" "$identity"
   touch "$dir/state/.last-watcher-beat"
   (run_integrated_autoarm "$dir" > "$dir/auto.out"; printf '%s\n' "$?" > "$dir/auto.status") &
   auto_pid=$!
+  fm_test_track_pid "$auto_pid" || ! kill -0 "$auto_pid" 2>/dev/null || fail "could not register fixture process cleanup"
   (FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" false > "$dir/guard.out"; printf '%s\n' "$?" > "$dir/guard.status") &
   guard_pid=$!
+  fm_test_track_pid "$guard_pid" || ! kill -0 "$guard_pid" 2>/dev/null || fail "could not register fixture process cleanup"
   wait "$auto_pid"
   wait "$guard_pid"
   kill "$pid" 2>/dev/null || true
@@ -2078,6 +2099,7 @@ test_hook_claude_mode_allow_resets_budget() {
   : > "$dir/state/.claude-autoarm-failure-alarmed"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   identity=$(watcher_identity "$dir" "$pid") || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -2088,7 +2110,7 @@ test_hook_claude_mode_allow_resets_budget() {
   out=$(run_hook_claude "$dir" false); status=$?
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  rm -rf "$dir/state/.watch.lock"
+  fm_test_remove_tree "$dir/state/.watch.lock"
   expect_code 0 "$status" "--claude must allow once the watcher is healthy again"
   [ ! -f "$dir/state/.turnend-claude-blocks" ] || fail "--claude allow must reset the consecutive-block budget"
   [ ! -f "$dir/state/.claude-autoarm-failure-notified" ] || fail "positive watcher recovery must reset the failure notice"
@@ -2105,11 +2127,14 @@ test_hook_claude_mode_waits_for_late_claim() {
   (
     sleep 0.4
     sleep 60 &
-    record_autoarm_owner "$dir" $!
-    printf '%s\n' $! > "$dir/holder.pid"
+    holder=$!
+    fm_test_track_pid "$holder" || ! kill -0 "$holder" 2>/dev/null || fail "could not register fixture process cleanup"
+    record_autoarm_owner "$dir" "$holder"
+    printf '%s\n' "$holder" > "$dir/holder.pid"
     wait
   ) &
   helper=$!
+  fm_test_track_pid "$helper" || ! kill -0 "$helper" 2>/dev/null || fail "could not register fixture process cleanup"
   out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=3000 run_hook_claude "$dir" false); status=$?
   holder=$(cat "$dir/holder.pid" 2>/dev/null || true)
   kill "$holder" 2>/dev/null || true
@@ -2129,6 +2154,7 @@ test_hook_claude_mode_secondmate_reblocks_like_primary() {
   assert_contains "$out" "TURN WOULD END BLIND" "--claude secondmate re-block must carry the blind-turn banner"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   record_autoarm_owner "$dir" "$pid"
   out=$(run_hook_claude "$dir" false); status=$?
   kill "$pid" 2>/dev/null || true
@@ -2177,6 +2203,7 @@ test_hook_away_daemon_allows_between_watcher_cycles() {
   dir=$(make_away_home_between_cycles "$TMP_ROOT/hook-afk-daemon-live")
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   record_daemon_lock "$dir" "$pid" || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -2200,6 +2227,7 @@ test_hook_away_daemon_allows_over_dead_watcher_lock() {
   record_watcher_lock "$dir" "$dead" "dead watcher identity"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   record_daemon_lock "$dir" "$pid" || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -2238,6 +2266,7 @@ test_hook_away_mode_blocks_on_pid_reused_daemon() {
   dir=$(make_away_home_between_cycles "$TMP_ROOT/hook-afk-reused-daemon")
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   # Same pid, an identity from some earlier process: exactly what a recycled pid
   # looks like, and the reason a bare kill -0 is not ownership evidence.
   record_daemon_lock "$dir" "$pid" "some other process identity"
@@ -2255,6 +2284,7 @@ test_hook_away_mode_blocks_on_stale_beacon() {
   touch -t 202001010000 "$dir/state/.last-watcher-beat"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   record_daemon_lock "$dir" "$pid" || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -2274,6 +2304,7 @@ test_hook_daemon_lock_is_ignored_without_away_mode() {
   rm -f "$dir/state/.afk"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   record_daemon_lock "$dir" "$pid" || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -2301,6 +2332,7 @@ test_hook_away_daemon_allows_beacon_within_poll_derived_grace() {
   dir=$(make_away_home_between_cycles "$TMP_ROOT/hook-afk-poll-grace-healthy")
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   record_daemon_lock "$dir" "$pid" || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -2335,6 +2367,7 @@ test_hook_away_daemon_blocks_beacon_older_than_poll_derived_grace() {
   dir=$(make_away_home_between_cycles "$TMP_ROOT/hook-afk-poll-grace-stale")
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   record_daemon_lock "$dir" "$pid" || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -2358,6 +2391,7 @@ test_hook_no_afk_ignores_poll_derived_grace() {
   rm -f "$dir/state/.afk"
   sleep 60 &
   pid=$!
+  fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register fixture process cleanup"
   record_daemon_lock "$dir" "$pid" || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -2375,6 +2409,11 @@ test_hook_no_afk_ignores_poll_derived_grace() {
   assert_contains "$out" "$REQUIRED_REASON" "block reason must contain the exact required instruction"
   pass "fm-turnend-guard: with away mode off, the poll-derived grace never applies"
 }
+
+# Failure-unwind regressions load fixtures without running the suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
 
 test_predicate_healthy_no_inflight
 test_predicate_unhealthy_no_beacon
