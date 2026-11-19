@@ -2500,6 +2500,7 @@ test_projection_close_non_emptying_stays_plain_without_proof_or_move() {
   printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w1","active_tab_id":"w1:t1","focused":true},{"workspace_id":"w2","active_tab_id":"w2:t1","focused":false}]}}' > "$resp/7.out"
   printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t1","focused":true}]}}' > "$resp/8.out"
   sleep 300 & bgpid=$!
+  fm_test_track_pid "$bgpid" || ! kill -0 "$bgpid" 2>/dev/null || fail "could not register fixture process cleanup"
   make_death_lab "$dir" "$bgpid"
   fb=$(make_herdr_fakebin "$dir")
   out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
@@ -2556,6 +2557,7 @@ test_projection_close_ambiguous_positions_fall_back_to_plain_close() {
   printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w1","active_tab_id":"w1:t1","focused":true}]}}' > "$resp/9.out"
   printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t1","focused":true}]}}' > "$resp/10.out"
   sleep 300 & bgpid=$!
+  fm_test_track_pid "$bgpid" || ! kill -0 "$bgpid" 2>/dev/null || fail "could not register fixture process cleanup"
   make_death_lab "$dir" "$bgpid"
   fb=$(make_herdr_fakebin "$dir")
   out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
@@ -2592,6 +2594,7 @@ test_projection_close_move_failure_falls_back_to_plain_close() {
   cp "$resp/12.out" "$resp/13.out"
   printf '%s\n' '{"result":{"tabs":[{"tab_id":"w2:t1","focused":true}]}}' > "$resp/14.out"
   sleep 300 & bgpid=$!
+  fm_test_track_pid "$bgpid" || ! kill -0 "$bgpid" 2>/dev/null || fail "could not register fixture process cleanup"
   make_death_lab "$dir" "$bgpid"
   fb=$(make_herdr_fakebin "$dir")
   out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_SCRIPT_STATUS=1 \
@@ -2621,6 +2624,7 @@ test_projection_close_busy_pane_falls_back_to_plain_close() {
   printf '%s\n' '{"result":{"panes":[{"pane_id":"w2:p2","tab_id":"w2:t2"}]}}' > "$resp/5.out"
   cp "$resp/1.out" "$resp/6.out"
   sleep 300 & bgpid=$!
+  fm_test_track_pid "$bgpid" || ! kill -0 "$bgpid" 2>/dev/null || fail "could not register fixture process cleanup"
   # The pane still has a foreground agent, so the idle-shell proof refuses.
   printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w2:p2","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[{"pid":%s,"name":"zsh","argv0":"zsh"},{"pid":99999,"name":"pi","argv0":"pi"}]}}}\n' "$bgpid" "$bgpid" "$bgpid" > "$resp/7.out"
   printf '%s\n' '{"error":{"code":"pane_not_found"}}' > "$resp/9.out"
@@ -2687,7 +2691,8 @@ test_projection_close_death_escalates_sigkill_after_sighup_survival() {
   printf '%s\n' '{"result":{"tabs":[{"tab_id":"w2:t2","workspace_id":"w2"}]}}' > "$resp/4.out"
   printf '%s\n' '{"result":{"panes":[{"pane_id":"w2:p2","tab_id":"w2:t2"}]}}' > "$resp/5.out"
   cp "$resp/1.out" "$resp/6.out"
-  bash -c 'trap "" HUP; sleep 300' & bgpid=$!
+  bash -c 'trap "" HUP; exec sleep 300' & bgpid=$!
+  fm_test_track_pid "$bgpid" || ! kill -0 "$bgpid" 2>/dev/null || fail "could not register fixture process cleanup"
   death_process_info_fixture w2:p2 "$bgpid" > "$resp/7.out"
   printf '%s\n' '{"error":{"code":"internal_error","message":"transient failure"}}' > "$resp/8.out"
   printf '%s\n' '{"result":{"pane":{"pane_id":"w2:p2"}}}' > "$resp/9.out"
@@ -2723,7 +2728,8 @@ test_projection_close_death_failure_falls_back_to_plain_close() {
   printf '%s\n' '{"result":{"tabs":[{"tab_id":"w2:t2","workspace_id":"w2"}]}}' > "$resp/4.out"
   printf '%s\n' '{"result":{"panes":[{"pane_id":"w2:p2","tab_id":"w2:t2"}]}}' > "$resp/5.out"
   cp "$resp/1.out" "$resp/6.out"
-  bash -c 'trap "" HUP; sleep 300' & bgpid=$!
+  bash -c 'trap "" HUP; exec sleep 300' & bgpid=$!
+  fm_test_track_pid "$bgpid" || ! kill -0 "$bgpid" 2>/dev/null || fail "could not register fixture process cleanup"
   death_process_info_fixture w2:p2 "$bgpid" > "$resp/7.out"
   printf '%s\n' '{"result":{"pane":{"pane_id":"w2:p2"}}}' > "$resp/8.out"
   printf '%s\n' '{"result":{"pane":{"pane_id":"w2:p2"}}}' > "$resp/9.out"
@@ -2758,6 +2764,7 @@ test_projection_close_death_still_restores_a_stolen_focus() {
   printf '%s\n' '{"result":{"panes":[{"pane_id":"w2:p2","tab_id":"w2:t2"}]}}' > "$resp/5.out"
   cp "$resp/1.out" "$resp/6.out"
   sleep 300 & bgpid=$!
+  fm_test_track_pid "$bgpid" || ! kill -0 "$bgpid" 2>/dev/null || fail "could not register fixture process cleanup"
   death_process_info_fixture w2:p2 "$bgpid" > "$resp/7.out"
   printf '%s\n' '{"error":{"code":"pane_not_found"}}' > "$resp/8.out"
   # The backstop still fires when the post-close snapshot disagrees.
@@ -2901,6 +2908,7 @@ test_kill_emptying_non_focused_uses_pane_death() {
   printf '%s\n' '{"result":{"panes":[{"pane_id":"w2:p2","tab_id":"w2:t2"}]}}' > "$resp/5.out"
   cp "$resp/1.out" "$resp/6.out"
   sleep 300 & bgpid=$!
+  fm_test_track_pid "$bgpid" || ! kill -0 "$bgpid" 2>/dev/null || fail "could not register fixture process cleanup"
   death_process_info_fixture w2:p2 "$bgpid" > "$resp/7.out"
   printf '%s\n' '{"error":{"code":"pane_not_found"}}' > "$resp/8.out"
   printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w1","active_tab_id":"w1:t1","focused":true}]}}' > "$resp/9.out"
@@ -2951,6 +2959,7 @@ test_kill_focused_workspace_stays_plain_close() {
   printf '%s\n' '{"result":{"pane":{"pane_id":"w2:p2","tab_id":"w2:t2","workspace_id":"w2"}}}' > "$resp/3.out"
   printf '%s\n' '{"error":{"code":"pane_not_found"}}' > "$resp/5.out"
   sleep 300 & bgpid=$!
+  fm_test_track_pid "$bgpid" || ! kill -0 "$bgpid" 2>/dev/null || fail "could not register fixture process cleanup"
   make_death_lab "$dir" "$bgpid"
   fb=$(make_herdr_fakebin "$dir")
   out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
@@ -6010,6 +6019,11 @@ test_wait_transition_clean_timeout_returns_1() {
 
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"
+
+# Failure-unwind regressions load fixtures without running the suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
 
 test_version_check_accepts_current_protocol
 test_version_check_refuses_old_protocol

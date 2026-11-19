@@ -155,7 +155,7 @@ test_writers_are_inert_on_a_home_that_opted_out() {
 }
 
 test_operational_foreign_and_unowned_input_is_dropped() {
-  local home other
+  local home other holder_pid
   home=$(make_home dropped)
   as_session "$home" '
     printf "%s" "{\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"\342\201\243FIRSTMATE_OP: v1 watcher: signal: demo.status\"}" \
@@ -174,10 +174,12 @@ test_operational_foreign_and_unowned_input_is_dropped() {
 
   other=$(make_home unowned)
   sleep 30 &
-  printf '%s\n' "$!" > "$other/state/.lock"
+  holder_pid=$!
+  fm_test_track_pid "$holder_pid" || ! kill -0 "$holder_pid" 2>/dev/null || fail "could not register fixture process cleanup"
+  printf '%s\n' "$holder_pid" > "$other/state/.lock"
   printf '%s' '{"hook_event_name":"UserPromptSubmit","prompt":"not the owner"}' \
     | FM_HOME="$other" FM_ROOT_OVERRIDE="$PRIMARY_ROOT" "$FAKE_CLAUDE" -c '"$0" hook claude' "$MIRROR"
-  kill "$(cat "$other/state/.lock")" 2>/dev/null || true
+  kill "$holder_pid" 2>/dev/null || true
   assert_absent "$other/state/.host-mirror.jsonl" "a session that does not hold the fleet lock must mirror nothing"
   pass "mirror: operational input, a harness-started turn, a foreign host's payload, other events, and a session without the lock are never mirrored"
 }
@@ -456,6 +458,11 @@ test_only_proven_writers_are_verified() {
   expect_code 2 "$("$MIRROR" verified >/dev/null 2>&1; echo $?)" "verified without a harness must be a usage error"
   pass "only Claude and Cursor, the primaries with proven writers, have a verified dialog mirror"
 }
+
+# Failure-unwind regressions load fixtures without running the suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
 
 test_every_harness_registration_writes_the_mirror
 test_writers_are_inert_on_a_home_that_opted_out

@@ -841,6 +841,7 @@ EOF
 
   sleep 300 &
   holder_pid=$!
+  fm_test_track_pid "$holder_pid" || ! kill -0 "$holder_pid" 2>/dev/null || fail "could not register fixture process cleanup"
   printf '%s\n' "$holder_pid" > "$home/state/.lock"
 
   status=0
@@ -3093,6 +3094,11 @@ EOF
 
   pass "session start rejects Pi loaded markers from previous sessions"
 }
+
+# Failure-unwind regressions load fixtures without running the suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
 
 test_context_digest_absent_empty_present
 test_lock_refusal_read_only_path

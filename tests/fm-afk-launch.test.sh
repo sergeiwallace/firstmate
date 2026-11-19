@@ -19,6 +19,9 @@
 #   only the terminal lifecycle.
 set -u
 
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAUNCH="$ROOT/bin/fm-afk-launch.sh"
 START="$ROOT/bin/fm-afk-start.sh"
@@ -55,6 +58,7 @@ GLOBAL_CLEANUP() {
   for s in $TRACK_TMUX_SESSIONS; do
     tmux kill-session -t "$s" 2>/dev/null || true
   done
+  fm_test_cleanup
 }
 trap GLOBAL_CLEANUP EXIT
 
@@ -341,7 +345,7 @@ unit_relative_paths_are_absolute_before_daemon_launch() {
 # ---------------------------------------------------------------------------
 unit_fresh_vs_refresh() {
   local st sleep_pid lock
-  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-refresh.XXXXXX")
+  st=$(fm_test_tmproot fm-afk-refresh) || { fail "could not create refresh fixture"; return 1; }
   mkdir -p "$st/state"
   : > "$st/state/.subsuper-escalations"
   : > "$st/state/.subsuper-inject-wedged"
@@ -350,6 +354,7 @@ unit_fresh_vs_refresh() {
   # daemon_lock_held_by_live_daemon returns true (a refresh).
   sleep 600 &
   sleep_pid=$!
+  fm_test_track_pid "$sleep_pid" || ! kill -0 "$sleep_pid" 2>/dev/null || fail "could not register fixture process cleanup"
   lock="$st/state/.supervise-daemon.lock"
   mkdir -p "$lock"
   printf '%s' "$sleep_pid" > "$lock/pid"
@@ -1785,6 +1790,11 @@ e2e_rex() {
   rex_test_cleanup
   rm -rf "$home_tmp" 2>/dev/null || true
 }
+
+# Failure-unwind regressions load fixtures without running the suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
 
 unit_clear_stale
 unit_enter_records_the_posture_in_one_step_without_a_daemon
