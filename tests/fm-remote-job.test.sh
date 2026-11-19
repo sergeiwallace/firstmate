@@ -50,7 +50,7 @@ cleanup_remote_job_fixture() {
   if [ -f "$STATE_ROOT/worker.pid" ]; then
     fm_remote_job_stop_worker_tree "$(cat "$STATE_ROOT/worker.pid")" || true
   fi
-  rm -rf -- "$TMP_ROOT"
+  fm_test_cleanup
 }
 trap cleanup_remote_job_fixture EXIT
 
@@ -184,6 +184,74 @@ SH
   pid=''
   pass "$label: result and command samples use $expected seconds; dispatcher uses four $dispatch-second waits then one second"
 )
+
+test_quarantine_recovery() {
+  local RECOVERY_HOME RECOVERY_STATE RECOVERY_JOB RECOVERY_REFUSED_RC
+  local QUARANTINED_PROCESS_PID QUARANTINE_OWNER_PID
+
+  RECOVERY_HOME="$TMP_ROOT/recovery-account"
+  RECOVERY_STATE="$TMP_ROOT/recovery-jobs"
+  RECOVERY_JOB="$RECOVERY_STATE/jobs/job-quarantine"
+  mkdir -p "$RECOVERY_HOME" "$RECOVERY_STATE/jobs" "$RECOVERY_STATE/logs" \
+    "$RECOVERY_STATE/worker.lock" "$RECOVERY_JOB/.claim"
+  chmod 700 "$RECOVERY_HOME" "$RECOVERY_STATE" "$RECOVERY_STATE/jobs" "$RECOVERY_STATE/logs" \
+    "$RECOVERY_STATE/worker.lock" "$RECOVERY_JOB" "$RECOVERY_JOB/.claim"
+  sleep 20 &
+  QUARANTINED_PROCESS_PID=$!
+  fm_test_track_pid "$QUARANTINED_PROCESS_PID" || ! kill -0 "$QUARANTINED_PROCESS_PID" 2>/dev/null || fail "could not register fixture process cleanup"
+  sleep 0.01 &
+  QUARANTINE_OWNER_PID=$!
+  wait "$QUARANTINE_OWNER_PID" 2>/dev/null || true
+  printf '%s\n' "$QUARANTINE_OWNER_PID" > "$RECOVERY_STATE/worker.lock/pid"
+  printf 'stale\n' > "$RECOVERY_STATE/worker.lock/start"
+  printf 'stale\n' > "$RECOVERY_STATE/worker.lock/command"
+  printf 'active execution could not be confirmed stopped\n' > "$RECOVERY_STATE/worker.lock/quarantine"
+  printf 'running\n' > "$RECOVERY_JOB/state"
+  printf '%s\n' "$QUARANTINE_OWNER_PID" > "$RECOVERY_JOB/.claim/owner"
+  printf '%s\n' "$QUARANTINED_PROCESS_PID" > "$RECOVERY_JOB/.claim/supervisor"
+  : > "$RECOVERY_JOB/stdout"
+  : > "$RECOVERY_JOB/stderr"
+  chmod 600 "$RECOVERY_STATE/worker.lock"/* "$RECOVERY_JOB/state" "$RECOVERY_JOB/.claim"/* \
+    "$RECOVERY_JOB/stdout" "$RECOVERY_JOB/stderr"
+  touch -t 200001010000 "$RECOVERY_STATE/worker.lock"
+  set +e
+  HOME="$RECOVERY_HOME" FM_ROOT_OVERRIDE="$REMOTE_ROOT" FM_REMOTE_JOB_STATE_ROOT="$RECOVERY_STATE" \
+    FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux "$REMOTE_ROOT/bin/fm-remote-job-worker.sh" \
+    > "$TMP_ROOT/recovery-refused.out" 2> "$TMP_ROOT/recovery-refused.err"
+  RECOVERY_REFUSED_RC=$?
+  set -e
+  [ "$RECOVERY_REFUSED_RC" -ne 0 ] || fail "quarantine recovery ignored a recorded live process"
+  assert_present "$RECOVERY_STATE/worker.lock/quarantine" "a live recorded process lost quarantine protection"
+  printf '%s\n' "$QUARANTINED_PROCESS_PID" > "$RECOVERY_JOB/.claim/owner"
+  printf 'stale owner identity\n' > "$RECOVERY_JOB/.claim/owner_start"
+  printf 'stale supervisor identity\n' > "$RECOVERY_JOB/.claim/supervisor_start"
+  chmod 600 "$RECOVERY_JOB/.claim/owner" "$RECOVERY_JOB/.claim/owner_start" \
+    "$RECOVERY_JOB/.claim/supervisor_start"
+  HOME="$RECOVERY_HOME" FM_ROOT_OVERRIDE="$REMOTE_ROOT" FM_REMOTE_JOB_STATE_ROOT="$RECOVERY_STATE" \
+    FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux "$REMOTE_ROOT/bin/fm-remote-job-worker.sh" \
+    > "$TMP_ROOT/recovery-worker.out" 2> "$TMP_ROOT/recovery-worker.err" &
+  RECOVERY_WORKER_PID=$!
+  for _ in $(seq 1 300); do
+    [ -f "$RECOVERY_STATE/worker.ready" ] && break
+    sleep 0.05
+  done
+  assert_present "$RECOVERY_STATE/worker.ready" "a reused supervisor pid did not permit worker recovery"
+  assert_absent "$RECOVERY_STATE/worker.lock/quarantine" "recovered worker retained stale quarantine"
+  kill -0 "$QUARANTINED_PROCESS_PID" 2>/dev/null \
+    || fail "worker recovery signalled a process whose supervisor identity did not match"
+  kill -TERM "$RECOVERY_WORKER_PID"
+  wait "$RECOVERY_WORKER_PID" 2>/dev/null || true
+  RECOVERY_WORKER_PID=
+  kill "$QUARANTINED_PROCESS_PID" 2>/dev/null || true
+  wait "$QUARANTINED_PROCESS_PID" 2>/dev/null || true
+  pass "quarantine recovery refuses unverifiable supervisors and ignores reused pids"
+}
+
+# Failure-unwind regressions load fixtures without running the suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
+
 poll_cadence_case default '' '' 0.25 0.05 || exit 1
 poll_cadence_case legacy 0.07 '' 0.07 0.07 || exit 1
 poll_cadence_case active 0.07 0.12 0.12 0.07 || exit 1
@@ -731,61 +799,7 @@ sleep 3
 assert_absent "$QUARANTINE_SIDE_EFFECT" "the quarantined command mutated after explicit termination"
 pass "failed shutdown quarantines ownership against replacement workers"
 
-RECOVERY_HOME="$TMP_ROOT/recovery-account"
-RECOVERY_STATE="$TMP_ROOT/recovery-jobs"
-RECOVERY_JOB="$RECOVERY_STATE/jobs/job-quarantine"
-mkdir -p "$RECOVERY_HOME" "$RECOVERY_STATE/jobs" "$RECOVERY_STATE/logs" \
-  "$RECOVERY_STATE/worker.lock" "$RECOVERY_JOB/.claim"
-chmod 700 "$RECOVERY_HOME" "$RECOVERY_STATE" "$RECOVERY_STATE/jobs" "$RECOVERY_STATE/logs" \
-  "$RECOVERY_STATE/worker.lock" "$RECOVERY_JOB" "$RECOVERY_JOB/.claim"
-sleep 20 &
-QUARANTINED_PROCESS_PID=$!
-sleep 0.01 &
-QUARANTINE_OWNER_PID=$!
-wait "$QUARANTINE_OWNER_PID" 2>/dev/null || true
-printf '%s\n' "$QUARANTINE_OWNER_PID" > "$RECOVERY_STATE/worker.lock/pid"
-printf 'stale\n' > "$RECOVERY_STATE/worker.lock/start"
-printf 'stale\n' > "$RECOVERY_STATE/worker.lock/command"
-printf 'active execution could not be confirmed stopped\n' > "$RECOVERY_STATE/worker.lock/quarantine"
-printf 'running\n' > "$RECOVERY_JOB/state"
-printf '%s\n' "$QUARANTINE_OWNER_PID" > "$RECOVERY_JOB/.claim/owner"
-printf '%s\n' "$QUARANTINED_PROCESS_PID" > "$RECOVERY_JOB/.claim/supervisor"
-: > "$RECOVERY_JOB/stdout"
-: > "$RECOVERY_JOB/stderr"
-chmod 600 "$RECOVERY_STATE/worker.lock"/* "$RECOVERY_JOB/state" "$RECOVERY_JOB/.claim"/* \
-  "$RECOVERY_JOB/stdout" "$RECOVERY_JOB/stderr"
-touch -t 200001010000 "$RECOVERY_STATE/worker.lock"
-set +e
-HOME="$RECOVERY_HOME" FM_ROOT_OVERRIDE="$REMOTE_ROOT" FM_REMOTE_JOB_STATE_ROOT="$RECOVERY_STATE" \
-  FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux "$REMOTE_ROOT/bin/fm-remote-job-worker.sh" \
-  > "$TMP_ROOT/recovery-refused.out" 2> "$TMP_ROOT/recovery-refused.err"
-RECOVERY_REFUSED_RC=$?
-set -e
-[ "$RECOVERY_REFUSED_RC" -ne 0 ] || fail "quarantine recovery ignored a recorded live process"
-assert_present "$RECOVERY_STATE/worker.lock/quarantine" "a live recorded process lost quarantine protection"
-printf '%s\n' "$QUARANTINED_PROCESS_PID" > "$RECOVERY_JOB/.claim/owner"
-printf 'stale owner identity\n' > "$RECOVERY_JOB/.claim/owner_start"
-printf 'stale supervisor identity\n' > "$RECOVERY_JOB/.claim/supervisor_start"
-chmod 600 "$RECOVERY_JOB/.claim/owner" "$RECOVERY_JOB/.claim/owner_start" \
-  "$RECOVERY_JOB/.claim/supervisor_start"
-HOME="$RECOVERY_HOME" FM_ROOT_OVERRIDE="$REMOTE_ROOT" FM_REMOTE_JOB_STATE_ROOT="$RECOVERY_STATE" \
-  FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux "$REMOTE_ROOT/bin/fm-remote-job-worker.sh" \
-  > "$TMP_ROOT/recovery-worker.out" 2> "$TMP_ROOT/recovery-worker.err" &
-RECOVERY_WORKER_PID=$!
-for _ in $(seq 1 300); do
-  [ -f "$RECOVERY_STATE/worker.ready" ] && break
-  sleep 0.05
-done
-assert_present "$RECOVERY_STATE/worker.ready" "a reused supervisor pid did not permit worker recovery"
-assert_absent "$RECOVERY_STATE/worker.lock/quarantine" "recovered worker retained stale quarantine"
-kill -0 "$QUARANTINED_PROCESS_PID" 2>/dev/null \
-  || fail "worker recovery signalled a process whose supervisor identity did not match"
-kill -TERM "$RECOVERY_WORKER_PID"
-wait "$RECOVERY_WORKER_PID" 2>/dev/null || true
-RECOVERY_WORKER_PID=
-kill "$QUARANTINED_PROCESS_PID" 2>/dev/null || true
-wait "$QUARANTINED_PROCESS_PID" 2>/dev/null || true
-pass "quarantine recovery refuses unverifiable supervisors and ignores reused pids"
+test_quarantine_recovery
 
 # A replacement stops a Linux worker by signalling its whole isolated group, and
 # the supervisor in that group forwards a second stop signal to the same serving

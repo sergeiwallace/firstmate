@@ -10,6 +10,9 @@ set -u
 
 # shellcheck source=tests/wake-helpers.sh
 . "$(dirname "${BASH_SOURCE[0]}")/wake-helpers.sh"
+# Notifier scripts share their suite's process cleanup registry.
+export FM_TEST_PID_REGISTRY
+export -f fm_test_track_pid fm_test_pid_start_time
 
 DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
 AFK_START="$ROOT/bin/fm-afk-start.sh"
@@ -2955,12 +2958,25 @@ test_wedge_alarm_hung_channel_times_out_and_falls_through() {
   pass "a hung notifier is bounded, logged, and falls through to the next channel"
 }
 
+write_wedge_alarm_sleeper() {  # <script-path>
+  cat > "$1" <<'SH'
+#!/usr/bin/env bash
+sleep 30 &
+child=$!
+fm_test_track_pid "$child" || exit 70
+printf '%s' "$child" > "$1"
+if [ "${2:-}" = wait ]; then wait; fi
+SH
+  chmod +x "$1"
+}
+
 test_wedge_alarm_backgrounded_command_times_out_and_reaps_descendant() {
   local dir daemon_log child_file child command
   dir=$(make_wedge_case wedge-backgrounded-timeout)
   daemon_log="$dir/daemon.log"
   child_file="$dir/notifier-child"
-  command="sleep 30 & printf '%s' \"\$!\" > '$child_file'"
+  write_wedge_alarm_sleeper "$dir/notifier"
+  command="exec '$dir/notifier' '$child_file'"
   LOG="$daemon_log" FM_WEDGE_ALARM_EXEC='' FM_WEDGE_ALARM_TIMEOUT_SECS=1 \
     wedge_alarm_via_command "$command" "away-mode WEDGED 900s"
   [ -s "$child_file" ] || fail "the backgrounded notifier did not record its descendant"
@@ -3000,10 +3016,12 @@ test_wedge_alarm_shutdown_stops_active_notifier_group() {
   local dir child_file pid child
   dir=$(make_wedge_case wedge-shutdown)
   child_file="$dir/notifier-child"
+  write_wedge_alarm_sleeper "$dir/notifier"
   (
     set -m
-    sh -c 'sleep 30 & printf "%s" "$!" > "$1"; wait' sh "$child_file" &
+    "$dir/notifier" "$child_file" wait &
     pid=$!
+    fm_test_track_pid "$pid" || ! kill -0 "$pid" 2>/dev/null || fail "could not register notifier process cleanup"
     while [ ! -s "$child_file" ]; do sleep 0.05; done
     child=$(cat "$child_file")
     WEDGE_ALARM_NOTIFIER_PID=$pid
@@ -3446,6 +3464,11 @@ test_inject_msg_defers_on_unrecognized_composer_state() {
   ) || fail "unrecognized composer-state inject_msg subshell failed"
   pass "inject_msg: unrecognized composer states defer by default"
 }
+
+# Failure-unwind regressions load fixtures without running the suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
 
 test_afk_start_refuses_when_flag_cannot_be_written
 test_afk_start_ignores_stale_pidfile_without_lock

@@ -9,6 +9,9 @@ set -u
 # shellcheck source=tests/lib.sh
 # shellcheck disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# The fake SSH collector shares its suite's process cleanup registry.
+export FM_TEST_PID_REGISTRY
+export -f fm_test_track_pid fm_test_pid_start_time
 # shellcheck source=bin/fm-secondmate-registry-lib.sh
 # shellcheck disable=SC1091
 . "$ROOT/bin/fm-secondmate-registry-lib.sh"
@@ -299,6 +302,7 @@ if [ -f "$remote_home/state/slow-ledger-read" ]; then
   done
   sleep 30 &
   sleeper=$!
+  fm_test_track_pid "$sleeper" || exit 70
   printf '%s %s\n' "$$" "$sleeper" >> "$FM_TEST_LEDGER_PID_LOG"
   wait "$sleeper"
 fi
@@ -3357,6 +3361,11 @@ test_a_remote_home_without_any_ledger_is_explicitly_unreadable_without_remote_co
     || fail "a no-ledger remote home triggered remote summary computation: $(cat "$parent/ledger-calls.log")"
   pass "a missing remote ledger stays explicitly unreadable without remote summary computation"
 }
+
+# Failure-unwind regressions load fixtures without running the suite.
+if [ "${FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0
+fi
 
 test_task_teardown_during_metadata_capture_does_not_abort_snapshot
 test_current_state_uses_captured_status_observation

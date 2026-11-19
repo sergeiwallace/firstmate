@@ -20,14 +20,29 @@ test_failure_unwind() {
   bash -c '
     export FM_PROCESS_CLEANUP_TEST_SOURCE_ONLY=1
     observer=$2
+    case $3 in
+      afk-refresh|session-lock-refusal|backend-herdr-*|remote-quarantine|daemon-*|bearings-ledger|host-mirror)
+        # Keep any leaked tree inside the parent-owned case directory.
+        export TMPDIR=$observer
+        ;;
+    esac
     # Record birth stamps while the children are alive, outside the fixture
     # tree removed by the child EXIT trap. The parent also owns RED cleanup.
     observe() {
-      local child
+      local child birth
       for child in "$@"; do
         kill -0 "$child" || exit 70
-        printf "%s\t%s\n" "$child" "$(fm_test_pid_start_time "$child")" >> "$observer/pids"
+        birth=$(fm_test_pid_start_time "$child") || exit 70
+        printf "%s\t%s\n" "$child" "$birth" >> "$observer/pids"
       done
+    }
+    inject_failure() {
+      local tree=$1
+      shift
+      [ -d "$tree" ] || exit 70
+      observe "$@"
+      printf "%s\n" "$tree" > "$observer/tree"
+      fail "injected fixture failure"
     }
     case $3 in
       turnend)
@@ -101,6 +116,102 @@ test_failure_unwind() {
         }
         fail() { printf "injected fixture failure\n" >&2; exit 1; }
         test_recorded_process_identity_cleanup_is_exact
+        ;;
+      afk-refresh)
+        . "$1/tests/fm-afk-launch.test.sh"
+        fail() { printf "not ok - %s\n" "$1" >&2; exit 1; }
+        mkdir() {
+          if [ -n "${lock:-}" ] && [ "${2:-}" = "$lock" ]; then
+            inject_failure "$st" "$sleep_pid"
+          fi
+          command mkdir "$@"
+        }
+        unit_fresh_vs_refresh
+        ;;
+      session-lock-refusal|host-mirror)
+        if [ "$3" = session-lock-refusal ]; then
+          . "$1/tests/fm-session-start.test.sh"
+          fixture=test_lock_refusal_read_only_path
+        else
+          . "$1/tests/fm-host-mirror.test.sh"
+          fixture=test_operational_foreign_and_unowned_input_is_dropped
+        fi
+        printf() {
+          # Only the lock-file write: fm_test_track_pid also prints the pid, and
+          # failing there would stop the fixture before its cleanup registration.
+          if [ -n "${holder_pid:-}" ] && [ "${1:-}" = "%s\n" ] && [ "${2:-}" = "$holder_pid" ]; then
+            unset -f printf
+            inject_failure "$TMP_ROOT" "$holder_pid"
+          fi
+          builtin printf "$@"
+        }
+        "$fixture"
+        ;;
+      backend-herdr-*)
+        . "$1/tests/fm-backend-herdr.test.sh"
+        make_death_lab() { inject_failure "$TMP_ROOT" "$2"; }
+        case $3 in
+          backend-herdr-nonempty) test_projection_close_non_emptying_stays_plain_without_proof_or_move ;;
+          backend-herdr-ambiguous) test_projection_close_ambiguous_positions_fall_back_to_plain_close ;;
+          backend-herdr-move) test_projection_close_move_failure_falls_back_to_plain_close ;;
+          backend-herdr-busy) test_projection_close_busy_pane_falls_back_to_plain_close ;;
+          backend-herdr-sigkill) test_projection_close_death_escalates_sigkill_after_sighup_survival ;;
+          backend-herdr-fallback) test_projection_close_death_failure_falls_back_to_plain_close ;;
+          backend-herdr-restore) test_projection_close_death_still_restores_a_stolen_focus ;;
+          backend-herdr-kill-emptying) test_kill_emptying_non_focused_uses_pane_death ;;
+          backend-herdr-kill-focused) test_kill_focused_workspace_stays_plain_close ;;
+          *) exit 72 ;;
+        esac
+        ;;
+      remote-quarantine)
+        . "$1/tests/fm-remote-job.test.sh"
+        touch() { inject_failure "$TMP_ROOT" "$QUARANTINED_PROCESS_PID"; }
+        set -e
+        test_quarantine_recovery
+        ;;
+      daemon-backgrounded)
+        . "$1/tests/fm-daemon.test.sh"
+        wedge_alarm_stop_active_notifier() {
+          local i
+          for ((i=0; i<100; i++)); do
+            [ ! -s "$child_file" ] || return 0
+            sleep 0.05
+          done
+        }
+        grep() {
+          if [ "${2:-}" = "command notifier timed out" ]; then
+            inject_failure "$TMP_ROOT" "$child"
+          fi
+          command grep "$@"
+        }
+        test_wedge_alarm_backgrounded_command_times_out_and_reaps_descendant
+        ;;
+      daemon-shutdown)
+        . "$1/tests/fm-daemon.test.sh"
+        wedge_alarm_stop_active_notifier() { inject_failure "$TMP_ROOT" "$pid" "$child"; }
+        test_wedge_alarm_shutdown_stops_active_notifier_group
+        ;;
+      bearings-ledger)
+        . "$1/tests/fm-bearings-snapshot.test.sh"
+        remote_home="$TMP_ROOT/remote"
+        export FM_TEST_LEDGER_ACTIVE_DIR="$TMP_ROOT/active"
+        export FM_TEST_LEDGER_CALL_LOG="$TMP_ROOT/calls"
+        export FM_TEST_LEDGER_PID_LOG="$TMP_ROOT/pids"
+        mkdir -p "$remote_home/state" "$FM_TEST_LEDGER_ACTIVE_DIR"
+        : > "$remote_home/state/slow-ledger-read"
+        : > "$FM_TEST_LEDGER_ACTIVE_DIR/overlap-proved"
+        fakebin=$(make_remote_ledger_ssh "$TMP_ROOT/ssh")
+        home_arg=$(printf "%s" "$remote_home" | base64 | tr -d "\n")
+        argv_arg=$(printf "fm-remote-file.sh\0" | base64)
+        "$fakebin/fake-ssh" -- fixture-host fm-remote-entrypoint.sh v1 root "$home_arg" "$argv_arg" &
+        collector=$!
+        for ((i=0; i<100; i++)); do
+          [ ! -s "$FM_TEST_LEDGER_PID_LOG" ] || break
+          sleep 0.05
+        done
+        read -r recorded_collector sleeper < "$FM_TEST_LEDGER_PID_LOG" || exit 70
+        [ "$collector" = "$recorded_collector" ] || exit 70
+        inject_failure "$TMP_ROOT" "$collector" "$sleeper"
         ;;
       tmux-invalid|tmux-close|tmux-forced|tmux-unreadable|tmux-child|tmux-gone|tmux-birth-mismatch|tmux-socket-mismatch)
         . "$1/tests/fm-teardown-endpoint-safety.test.sh"
@@ -193,6 +304,11 @@ SH
       fail "$name leaked its live fixture after failure"
     fi
   done < "$lab/pids"
+  if [ -s "$lab/tree" ]; then
+    local tree
+    IFS= read -r tree < "$lab/tree"
+    assert_absent "$tree" "$name leaked its fixture tree after failure"
+  fi
   pass "$name unwinds its live fixture after failure"
 }
 
@@ -213,20 +329,32 @@ test_startup_artifact_unwind() {
   pass "startup worker temporary artifacts unwind after failure"
 }
 
+remaining_sleepers=(
+  afk-refresh session-lock-refusal remote-quarantine host-mirror
+  backend-herdr-nonempty backend-herdr-ambiguous backend-herdr-move backend-herdr-busy
+  backend-herdr-sigkill backend-herdr-fallback backend-herdr-restore backend-herdr-kill-emptying
+  backend-herdr-kill-focused daemon-backgrounded daemon-shutdown bearings-ledger
+)
+
 case ${1:-all} in
   all)
-    for name in turnend watch-arm watcher-lock startup-network lint omp herdr procevent endpoint tmux-invalid tmux-close tmux-forced tmux-unreadable tmux-child tmux-gone tmux-birth-mismatch tmux-socket-mismatch; do
+    for name in turnend watch-arm watcher-lock startup-network lint omp herdr procevent endpoint "${remaining_sleepers[@]}" tmux-invalid tmux-close tmux-forced tmux-unreadable tmux-child tmux-gone tmux-birth-mismatch tmux-socket-mismatch; do
       test_failure_unwind "$name"
     done
     test_startup_artifact_unwind
     ;;
   sleepers)
-    for name in turnend watch-arm watcher-lock startup-network lint omp herdr procevent endpoint; do
+    for name in turnend watch-arm watcher-lock startup-network lint omp herdr procevent endpoint "${remaining_sleepers[@]}"; do
       test_failure_unwind "$name"
     done
     ;;
   tmux)
     for name in tmux-invalid tmux-close tmux-forced tmux-unreadable tmux-child tmux-gone tmux-birth-mismatch tmux-socket-mismatch; do
+      test_failure_unwind "$name"
+    done
+    ;;
+  remaining)
+    for name in "${remaining_sleepers[@]}"; do
       test_failure_unwind "$name"
     done
     ;;
